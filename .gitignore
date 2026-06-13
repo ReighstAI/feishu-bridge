@@ -1,0 +1,9 @@
+node_modules/
+.env
+*.lock
+managed-settings.json
+# runtime state — must never be committed (would leak the owner's open_id / creds)
+access.json
+bridge-settings.json
+bridge.conf
+launch-mode

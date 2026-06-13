@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "claude-code-lark",
+  "description": "Lark (Larksuite/Feishu) channel plugin for Claude Code",
+  "owner": {
+    "name": "MocA-Love"
+  },
+  "plugins": [
+    {
+      "name": "lark",
+      "description": "Lark (Larksuite/Feishu) messaging bridge with built-in access control. Manage pairing, allowlists, and policy via /lark:access.",
+      "category": "productivity",
+      "source": "./"
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "name": "lark",
+  "description": "Lark (Larksuite / Feishu) channel for Claude Code \u2014 messaging bridge with built-in access control. Manage pairing, allowlists, and policy via /lark:access.",
+  "version": "0.9.0",
+  "keywords": [
+    "lark",
+    "larksuite",
+    "feishu",
+    "messaging",
+    "channel",
+    "mcp"
+  ]
+}
