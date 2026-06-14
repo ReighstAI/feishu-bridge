@@ -4,6 +4,28 @@ All notable changes to the Feishu ↔ Claude Code bridge. Versions follow
 semantic versioning. The running bridge stamps its version in the connection
 log: `connected (bot: …) [vX.Y.Z]`.
 
+## 0.9.1 — 2026-06-14
+
+Fix: a fresh-machine install could deadlock at boot on two interactive dialogs
+that fire *before* the channel connects — so nothing surfaces to Feishu and the
+bridge silently never answers (and re-hangs on every reboot). A machine that has
+already accepted both dialogs by hand never sees this, which is why it slipped
+through pre-release testing.
+
+- **Workspace-trust dialog** ("Do you trust the files in this folder?"): fires in
+  every permission mode, including bypass; there is no CLI flag to skip it for an
+  interactive session (only `-p`/non-interactive skips it). The installer now
+  marks the chosen workdir trusted in `~/.claude.json` (atomic temp+rename,
+  merge-safe) — equivalent to clicking "Yes, I trust this folder".
+- **Bypass-mode warning**: the one-time "Bypass Permissions" prompt. The
+  generated `bridge-settings.json` now carries `skipDangerousModePermissionPrompt:
+  true`, loaded at boot via `--settings` (same path that already pre-clears the
+  project-MCP discovery prompt).
+
+Upgrade: `cd ~/feishu-bridge && git pull && ./install.sh --auto` (reuses creds),
+then `launchctl kickstart -k gui/$(id -u)/com.feishu-bridge.daemon` to restart
+once and confirm the headless relaunch reconnects.
+
 ## 0.9.0 — 2026-06-13
 
 Consolidates the development versions 0.3–0.9 (built and verified on a live

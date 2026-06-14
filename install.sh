@@ -96,12 +96,17 @@ fi
 #  - enableAllProjectMcpServers: auto-approve project MCP servers so non-bypass
 #    launches don't hang at the MCP-discovery prompt (fires before the channel
 #    server is up, so the bridge can't surface it).
+#  - skipDangerousModePermissionPrompt: bypassPermissions mode shows a one-time
+#    "Bypass Permissions" warning at launch; it fires before the channel is up,
+#    so a headless launchd reboot would deadlock on it with nobody to dismiss it.
+#    Pre-accept it. Loaded at boot via --settings, same path as the line above.
 #  - permissions.allow: pre-allow the bridge's OWN Feishu tools (reply/react/…)
 #    — they only message the owner, zero risk, and must never prompt or the
 #    session freezes when it tries to reply in a non-bypass mode.
 cat > "$STATE_DIR/bridge-settings.json" <<'EOF'
 {
   "enableAllProjectMcpServers": true,
+  "skipDangerousModePermissionPrompt": true,
   "permissions": {
     "allow": [
       "mcp__plugin_lark_lark__reply",
@@ -113,7 +118,7 @@ cat > "$STATE_DIR/bridge-settings.json" <<'EOF'
   }
 }
 EOF
-ok "bridge-settings.json：自动批准项目 MCP + 预授权飞书回复工具（非 bypass 不卡）"
+ok "bridge-settings.json：自动批准项目 MCP + 跳过 bypass 警告 + 预授权飞书回复工具（非 bypass 不卡）"
 
 # ── 2. working dir + bridge.conf ─────────────────────────────────────────────
 say "2/7  工作目录与默认模式"
@@ -127,6 +132,33 @@ BRIDGE_PLUGIN="lark@claude-code-lark"
 BRIDGE_TMUX_SESSION="$SESSION"
 EOF
 ok "bridge.conf：workdir=$BRIDGE_WORKDIR mode=$BRIDGE_MODE"
+
+# Pre-clear the workspace-trust dialog for the workdir. The bridge runs claude
+# headlessly via launchd, and the "Do you trust the files in this folder?" prompt
+# fires at startup BEFORE the channel connects — with nobody at the terminal to
+# answer it, the bridge deadlocks (silent "messages get no response", and again
+# on every reboot). There is NO CLI flag to skip it for an interactive session
+# (only -p/non-interactive skips it), so the only fix is to mark the folder
+# trusted in ~/.claude.json — exactly what clicking "Yes, I trust this folder"
+# writes. Atomic temp+rename so a concurrent claude can never read a half-written
+# file; merge-safe so all other claude.json state is preserved.
+CJSON="$HOME/.claude.json"
+if [ -f "$CJSON" ]; then
+  CJSON_PATH="$CJSON" TRUST_DIR="$BRIDGE_WORKDIR" bun -e '
+    const fs = require("fs");
+    const p = process.env.CJSON_PATH, w = process.env.TRUST_DIR;
+    let d; try { d = JSON.parse(fs.readFileSync(p, "utf8")); } catch (e) { process.exit(3); }
+    if (!d.projects || typeof d.projects !== "object") d.projects = {};
+    if (!d.projects[w] || typeof d.projects[w] !== "object") d.projects[w] = {};
+    d.projects[w].hasTrustDialogAccepted = true;
+    const tmp = p + ".tmp." + process.pid;
+    fs.writeFileSync(tmp, JSON.stringify(d, null, 2));
+    fs.renameSync(tmp, p);
+  ' && ok "已预批准工作目录信任（开机不会卡在「是否信任此文件夹」确认框）" \
+    || warn "预批准信任失败（claude.json 解析异常）；首次启动可能弹一次信任框，到终端按 1 即可。"
+else
+  warn "未找到 ~/.claude.json（Claude 还没登录过？）；首次启动可能弹信任框，到终端按 1 即可。"
+fi
 
 # ── 3. install scripts ───────────────────────────────────────────────────────
 say "3/7  安装脚本"

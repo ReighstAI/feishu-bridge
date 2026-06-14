@@ -90,5 +90,6 @@ cd feishu-bridge
 ## 排查
 
 - **发消息没反应（或时有时无）**：先看旧的 Python 桥是不是还在跑——一个机器人只能有一条连接，跑 `bash ~/.feishu-bridge/bin/stop-old-bridge.sh`。再看 `tail ~/.claude/channels/lark/server.log`：有 `failed to fetch bot info` 就是 App ID/Secret 不对，或飞书后台没开「长连接 / 事件订阅」。
+- **装完一直完全没反应（不是时有时无，是从来不回），或重启后突然不回了**：旧版（≤0.9.0）在全新机器上可能卡在两个开机对话框——「是否信任此文件夹」和 bypass 模式警告——它们在频道连上之前就弹、手机端看不到也点不了，桥就一直连不上。0.9.1 起安装器会自动预批准这两个。升级修复：`cd ~/feishu-bridge && git pull && ./install.sh --auto`，再 `launchctl kickstart -k gui/$(id -u)/com.feishu-bridge.daemon` 重启一次验证。
 - **每次重启弹「开发频道」警告框**：频道白名单（managed-settings.json）没写成。重跑安装器第 5 步的 sudo 命令。
 - **`/model` 之类打开了选择器没反应**：少数命令会开交互选择器，send-keys 进得去但选不动——这类需要在终端里操作，属于已知边界。
