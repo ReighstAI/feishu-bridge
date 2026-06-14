@@ -4,6 +4,16 @@ All notable changes to the Feishu ↔ Claude Code bridge. Versions follow
 semantic versioning. The running bridge stamps its version in the connection
 log: `connected (bot: …) [vX.Y.Z]`.
 
+## 0.9.2 — 2026-06-14
+
+Fix: re-running the installer to upgrade silently reset the permission mode (and
+workdir) to the built-in default, because it ignored the saved `bridge.conf`. The
+documented upgrade — `git pull && ./install.sh --auto` with nothing passed —
+would flip a bypassPermissions bridge back to acceptEdits. The installer now
+reads the existing `bridge.conf` and reuses those values as the defaults. An
+explicit env var still overrides; a fresh install still falls back to
+`$HOME` / `acceptEdits`.
+
 ## 0.9.1 — 2026-06-14
 
 Fix: a fresh-machine install could deadlock at boot on two interactive dialogs

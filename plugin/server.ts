@@ -2526,7 +2526,7 @@ function startWsClient(): void {
     loggerLevel: Lark.LoggerLevel.info,
   })
   wsClient.start({ eventDispatcher })
-  connLog(`connected` + (botName ? ` (bot: ${botName})` : '') + ' [v0.9.1]')
+  connLog(`connected` + (botName ? ` (bot: ${botName})` : '') + ' [v0.9.2]')
 }
 
 function stopWsClient(): void {

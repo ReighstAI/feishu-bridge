@@ -84,7 +84,7 @@ cd feishu-bridge
 | 起桥 | `launchctl kickstart -k gui/$(id -u)/com.feishu-bridge.daemon` |
 | 看日志 | `tail -f /tmp/feishu-bridge.log` |
 | 改了配置/重启 | `launchctl kickstart -k gui/$(id -u)/com.feishu-bridge.daemon` |
-| 升级到新版本 | `cd ~/feishu-bridge && git pull && ./install.sh --auto`（会复用现有凭据） |
+| 升级到新版本 | `cd ~/feishu-bridge && git pull && ./install.sh --auto`（会复用现有凭据和配置：工作目录、权限模式保持不变） |
 | 卸载 | `./uninstall.sh`（加 `--purge` 连凭据+插件一起删） |
 
 ## 排查
