@@ -4,6 +4,77 @@ All notable changes to the Feishu ↔ Claude Code bridge. Versions follow
 semantic versioning. The running bridge stamps its version in the connection
 log: `connected (bot: …) [vX.Y.Z]`.
 
+## 0.13.0 — 2026-06-17
+
+Batch B: three turn-delivery and connection-resilience fixes.
+
+- **Rapid-input debounce-merge.** When you send text and then several files in
+  quick succession, the text used to start a turn before the files arrived (an
+  idle-start race), spilling the attachments into a second turn. A short per-chat
+  debounce (600ms) on the outbound forward now coalesces a burst into one turn,
+  promoting each attachment to a channel attribute and inlining every path with an
+  explicit Read instruction so none is missed. A single message in the window is
+  forwarded byte-identically (no behavior change). Relaunch commands (`/new`,
+  `/mode`) and `/stop` drop the buffer rather than flush it, so a superseded
+  message never runs.
+- **Sleep/wake forced reconnect.** A watcher tied to socket ownership detects the
+  event-loop freeze of a machine sleep/suspend (a gap far larger than its tick) and
+  forces a WebSocket reconnect immediately, instead of waiting for the SDK's next
+  ping + 10s timeout to notice the dead socket. This closes the post-wake blind
+  window where messages silently went nowhere.
+- **Long-answer full delivery.** The run card is a status surface, not a long-text
+  channel — it truncates the answer to a preview past a size cap. When an answer
+  exceeds that cap, the full text is now also sent as a normal chunked message
+  (plain text so code blocks survive literally), so nothing is lost. Short answers
+  (the common case) keep the unchanged card-only path.
+
+## 0.12.1 — 2026-06-17
+
+- **Installer sets up voice transcription (best-effort).** The bridge has long
+  supported transcribing voice messages (0.12.0), but the installer never set up
+  the transcriber — so out of the box, voice degraded to a raw audio path. The
+  installer now installs `whisper-cpp` + `ffmpeg` via Homebrew, downloads the
+  `ggml-base.bin` model (~142MB) to `~/.local/share/whisper-cpp/`, and drops a
+  `whisper-transcribe` wrapper at `~/.local/bin/`. Entirely best-effort: no
+  Homebrew, no network, or a failed download all just `warn` and continue — the
+  core bridge install never fails over voice. Idempotent: re-running won't
+  re-download an existing model. Voice then transcribes automatically; if a
+  component is missing it falls back to the audio path as before.
+
+## 0.12.0 — 2026-06-16
+
+Parity bump: the live turn surface is rebuilt and the reliability/UX hardening
+from the 0.10–0.12 line lands.
+
+- **Run-card UI.** One persistent card per turn, mirroring the terminal in native
+  order: assistant text and tool calls interleaved as they happen, grouped into
+  collapsible panels, ending with the answer. A running clock keeps it from ever
+  looking frozen; the header settles green / red / grey / orange when the turn
+  ends (done / error / interrupted / timeout). The answer is sourced from the
+  transcript, so a fast Q&A can't finalize with an empty card.
+- **`/mode`, `/clear`, `/context`, `/help`.** `/mode` switches permission mode but
+  keeps the conversation (resumes the same session); `/clear` confirms plainly that
+  context was wiped; `/context` trims the usage chart to a glanceable summary;
+  `/help` replies with what actually works from a phone. Unknown commands get an
+  honest "not available here" instead of a misleading "sent".
+- **`/effort` intercept.** It's a launch flag, not a TUI command — the bridge now
+  says so plainly instead of silently no-op'ing.
+- **Network retry + backoff.** API calls retry on transient failures (HTTP 429/5xx,
+  rate-limit and network errors) with fixed backoff; harmless stale-sequence card
+  errors are classified and ignored so they don't abandon a healthy card.
+- **Voice transcription.** Voice messages are transcribed by the bridge so the
+  model receives text, not an audio path. Configurable binary
+  (`LARK_WHISPER_BIN`); degrades gracefully to the audio path if no transcriber is
+  installed.
+- **Crash-resume.** An unexpected exit (OOM / context overflow) resumes the
+  conversation on relaunch instead of starting fresh.
+- **Answer-delivery fallback.** If the final card update fails, or the model
+  produced an answer but never called the reply tool, the answer is still
+  delivered as a normal message rather than stranded in a frozen card.
+- **Card resilience.** Repeated update failures stop the high-frequency repaint
+  but keep the card alive so the terminal state still lands; the dead-socket
+  watchdog (ping timeout) is re-enabled to close the post-wake blind window.
+
 ## 0.9.2 — 2026-06-14
 
 Fix: re-running the installer to upgrade silently reset the permission mode (and

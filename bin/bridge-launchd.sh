@@ -34,7 +34,11 @@ while true; do
   if ! supervisor_alive; then
     echo "[wrapper] no supervisor — (re)creating tmux session $SESSION"
     tmux kill-session -t "$SESSION" 2>/dev/null
-    tmux new-session -d -s "$SESSION" "bash '$SUPERVISOR'"
+    # Size the pane wide + tall (-x/-y). Detached launchd sessions default to
+    # 80x24, which wraps and truncates command output (/context etc.) and breaks
+    # substring matching on the pane (busy markers, dialogs, approval prompts) —
+    # a wider pane is strictly better for everything the bridge reads off the TUI.
+    tmux new-session -d -x 220 -y 50 -s "$SESSION" "bash '$SUPERVISOR'"
     sleep 8
   fi
   sleep 15

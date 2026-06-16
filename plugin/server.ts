@@ -22,6 +22,18 @@ import { execSync, spawnSync } from 'child_process'
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, openSync, readSync, closeSync } from 'fs'
 import { homedir } from 'os'
 import { join, sep } from 'path'
+import {
+  initRunCardState,
+  ingestEntry,
+  markToolsResolved,
+  renderRunCard,
+  runCardKey,
+  finalAnswerText,
+  fmtDur,
+  MAX_TEXT,
+  type RunCardState,
+  type Terminal,
+} from './run-card.ts'
 
 // ─── Constants & env ────────────────────────────────────────────────────────
 
@@ -105,23 +117,66 @@ function validateId(id: string, label: string): string {
   return id
 }
 
+// Stale-sequence / non-increasing-sequence card errors (300317, 230001) are
+// HARMLESS: they mean a lower-seq card update raced a higher one and lost. A tagged
+// error so callers can ignore it (skip the retry, don't count it as a real failure
+// toward the card-abandon threshold) instead of treating it like a dropped message.
+class StaleSeqError extends Error {
+  constructor(public code: number, msg: string) { super(msg); this.name = 'StaleSeqError' }
+}
+function isStaleSeq(err: unknown): err is StaleSeqError {
+  return err instanceof StaleSeqError
+}
+const STALE_SEQ_CODES = new Set([300317, 230001])
+// Lark rate-limit / throttling codes that warrant a retry (alongside HTTP 429/5xx).
+const RATE_LIMIT_CODES = new Set([99991400, 99991663, 11232])
+// Fixed, deterministic backoff (no Math.random — banned in some contexts). Index is
+// the just-failed attempt (0,1) → wait before the next; last attempt never waits.
+const RETRY_DELAYS_MS = [200, 600, 1400]
+
 async function larkApi(method: string, path: string, body?: unknown): Promise<any> {
-  const token = await getTenantToken()
   const opts: RequestInit = {
     method,
     headers: {
-      'Authorization': `Bearer ${token}`,
+      'Authorization': '', // filled per-attempt below (token may refresh between tries)
       'Content-Type': 'application/json',
     },
   }
   if (body) opts.body = JSON.stringify(body)
-  const res = await fetch(`${API_BASE}${path}`, opts)
-  if (!res.ok) throw new Error(`Lark API ${method} ${path}: HTTP ${res.status}`)
-  const data = (await res.json()) as any
-  if (data.code !== undefined && data.code !== 0) {
-    throw new Error(`Lark API ${method} ${path}: code=${data.code} msg=${data.msg ?? 'unknown'}`)
+  const MAX_ATTEMPTS = 3
+  let lastErr: unknown
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    try {
+      const token = await getTenantToken()
+      ;(opts.headers as Record<string, string>)['Authorization'] = `Bearer ${token}`
+      const res = await fetch(`${API_BASE}${path}`, opts)
+      if (!res.ok) {
+        const transient = res.status === 429 || res.status >= 500
+        const err = new Error(`Lark API ${method} ${path}: HTTP ${res.status}`)
+        if (transient && attempt < MAX_ATTEMPTS - 1) { lastErr = err; await delay(RETRY_DELAYS_MS[attempt]); continue }
+        throw err
+      }
+      const data = (await res.json()) as any
+      if (data.code !== undefined && data.code !== 0) {
+        // Stale-seq: harmless, never retry, surface as a distinct benign outcome.
+        if (STALE_SEQ_CODES.has(data.code)) {
+          throw new StaleSeqError(data.code, `Lark API ${method} ${path}: stale sequence code=${data.code} msg=${data.msg ?? 'unknown'}`)
+        }
+        const err = new Error(`Lark API ${method} ${path}: code=${data.code} msg=${data.msg ?? 'unknown'}`)
+        if (RATE_LIMIT_CODES.has(data.code) && attempt < MAX_ATTEMPTS - 1) { lastErr = err; await delay(RETRY_DELAYS_MS[attempt]); continue }
+        throw err
+      }
+      return data
+    } catch (err) {
+      // StaleSeq is benign — surface immediately, never retry. A network-level throw
+      // (fetch rejected: DNS/connection reset) is transient — retry within budget.
+      if (isStaleSeq(err)) throw err
+      lastErr = err
+      if (attempt < MAX_ATTEMPTS - 1) { await delay(RETRY_DELAYS_MS[attempt]); continue }
+      throw err
+    }
   }
-  return data
+  throw lastErr
 }
 
 async function larkApiRaw(method: string, path: string): Promise<Response> {
@@ -585,6 +640,25 @@ async function downloadFile(messageId: string, fileKey: string, type: 'file' | '
   return path
 }
 
+// Transcribe a downloaded voice file via the local whisper wrapper. The bridge owns
+// this so the model receives text, not a "find a transcriber yourself" hint. Best-
+// effort: a missing binary or a failed run returns '' and the caller falls back to
+// leaving audio_path for the model. The wrapper prints "[transcription failed: …]" on
+// ffmpeg error and exits non-zero, so we treat non-zero / bracketed output as no text.
+const WHISPER_BIN = process.env.LARK_WHISPER_BIN ?? `${homedir()}/.local/bin/whisper-transcribe`
+function transcribeAudio(audioPath: string): string {
+  try {
+    const r = spawnSync(WHISPER_BIN, [audioPath], { encoding: 'utf8', timeout: 120_000 })
+    if (r.status !== 0) return ''
+    const out = (r.stdout ?? '').trim()
+    if (!out || /^\[transcription failed/i.test(out)) return ''
+    return out
+  } catch (err) {
+    process.stderr.write(`lark channel: transcription failed: ${err}\n`)
+    return ''
+  }
+}
+
 // ─── File upload ────────────────────────────────────────────────────────────
 
 async function uploadFile(filePath: string, fileType: 'opus' | 'mp4' | 'pdf' | 'doc' | 'xls' | 'ppt' | 'stream'): Promise<string> {
@@ -629,9 +703,9 @@ const mcp = new Server(
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
     instructions: [
-      'The sender reads Lark (Larksuite/Feishu), not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
+      'The sender reads Lark (Larksuite/Feishu), not this session. To send them a message you MUST use the reply tool. They also see a live status card that mirrors this turn, so after you call reply with your answer, END THE TURN — do not write any further text (no recap, no "what I told them" summary). Trailing narration just clutters the card beneath your answer.',
       '',
-      'Messages from Lark arrive as <channel source="lark" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is an image the sender attached. If it has reply_to_text, that is the message the sender is replying to (quoted context). If it has reply_to_image_path, Read that file — it is an image from the quoted message. If it has audio_path, it is a voice message (opus format) — transcribe it with whatever speech-to-text is available on this machine, then handle the transcribed request; if transcription is impossible, say so in your reply. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+      'Messages from Lark arrive as <channel source="lark" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is an image the sender attached. If it has file_path, that is a file (pdf/docx/pptx/xlsx/etc.) the sender attached — already downloaded to that local path; open or process it from there. If it has reply_to_text, that is the message the sender is replying to (quoted context). If it has reply_to_image_path, Read that file — it is an image from the quoted message. If it has audio_path, it is a voice message (opus format) — transcribe it with whatever speech-to-text is available on this machine, then handle the transcribed request; if transcription is impossible, say so in your reply. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
       'When the <channel> tag has a thread_root_id attribute, the message is inside a Lark thread. You MUST pass reply_to with the message_id so your response stays in the same thread. Never reply to the main chat when thread_root_id is present.',
       '',
@@ -738,9 +812,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const files = (args.files as string[] | undefined) ?? []
 
         assertAllowedChat(chat_id)
-        // Freeze the live-progress card (and wait out any in-flight edit)
-        // before converting it into the final answer.
-        await stopLiveProgress(chat_id)
+        // The run card is independent of replies now — it keeps tailing until the
+        // turn actually ends, so the answer goes out as its own message and we do
+        // NOT stop the card here. This is what fixes an intermediate "doc coming"
+        // reply going dark.
 
         for (const f of files) {
           assertSendable(f)
@@ -751,56 +826,43 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
         if (files.length > 10) throw new Error('max 10 attachments per message')
 
-        const access = loadAccess()
-        const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
-        const mode = access.chunkMode ?? 'length'
-        const replyMode = access.replyToMode ?? 'first'
-        const chunks = chunk(text, limit, mode)
         const sentIds: string[] = []
 
-        const thinkingId = pendingThinking.get(chat_id)
-        pendingThinking.delete(chat_id)
-
-        try {
-          for (let i = 0; i < chunks.length; i++) {
-            const shouldReplyTo =
-              reply_to != null &&
-              replyMode !== 'off' &&
-              (replyMode === 'all' || i === 0)
-
-            // First chunk: turn the "thinking" placeholder into the answer, in place.
-            if (i === 0 && thinkingId) {
-              try {
-                await larkApi('PUT', `/im/v1/messages/${thinkingId}`, {
+        // One message, not two: when a run card is tracking this turn, the answer
+        // is already shown there (read from the transcript in native order), so we
+        // do NOT post it again. Fall back to a normal chunked message only when
+        // there's no active run card (e.g. a reply outside a tracked turn).
+        const inCard = !!text && runCardActive(chat_id)
+        if (text && !inCard) {
+          const access = loadAccess()
+          const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
+          const mode = access.chunkMode ?? 'length'
+          const replyMode = access.replyToMode ?? 'first'
+          const chunks = chunk(text, limit, mode)
+          try {
+            for (let i = 0; i < chunks.length; i++) {
+              const shouldReplyTo =
+                reply_to != null && replyMode !== 'off' && (replyMode === 'all' || i === 0)
+              let data: any
+              if (shouldReplyTo) {
+                data = await larkApi('POST', `/im/v1/messages/${reply_to}/reply`, {
                   msg_type: 'text',
                   content: JSON.stringify({ text: chunks[i] }),
                 })
-                sentIds.push(thinkingId)
-                continue
-              } catch {
-                // edit failed (window expired / deleted) — fall through to a fresh send
+              } else {
+                data = await larkApi('POST', '/im/v1/messages?receive_id_type=chat_id', {
+                  receive_id: chat_id,
+                  msg_type: 'text',
+                  content: JSON.stringify({ text: chunks[i] }),
+                })
               }
+              const msgId = data.data?.message_id
+              if (msgId) sentIds.push(msgId)
             }
-
-            let data: any
-            if (shouldReplyTo) {
-              data = await larkApi('POST', `/im/v1/messages/${reply_to}/reply`, {
-                msg_type: 'text',
-                content: JSON.stringify({ text: chunks[i] }),
-              })
-            } else {
-              data = await larkApi('POST', '/im/v1/messages?receive_id_type=chat_id', {
-                receive_id: chat_id,
-                msg_type: 'text',
-                content: JSON.stringify({ text: chunks[i] }),
-              })
-            }
-            const msgId = data.data?.message_id
-            if (msgId) sentIds.push(msgId)
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err)
+            throw new Error(`reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`)
           }
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err)
-          throw new Error(`reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`)
         }
 
         // Send files as separate messages
@@ -836,8 +898,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
 
-        const result =
-          sentIds.length === 1
+        const result = inCard
+          ? (sentIds.length ? `answer shown in run card; ${sentIds.length} file(s) sent` : 'answer shown in run card')
+          : sentIds.length === 1
             ? `sent (id: ${sentIds[0]})`
             : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`
         return { content: [{ type: 'text', text: result }] }
@@ -956,55 +1019,55 @@ function resolveMentions(text: string, mentions?: LarkMention[]): string {
 // handleInbound posts one on receipt; the reply tool edits it into the answer.
 const pendingThinking = new Map<string, string>()
 
-// ─── Live progress (tool activity in the thinking card) ─────────────────────
-// While a turn runs, tail the session's transcript JSONL and edit the thinking
-// placeholder with live activity (tool calls, narration). The transcript is
-// located by scanning the bridge project's recent .jsonl files for the
-// injected Feishu message_id — unique per message, so other sessions writing
-// in the same project dir can never be mistaken for ours. Best-effort by
-// design: any failure (format drift, edit limits, races) degrades silently
-// back to the static "⏳ 正在思考…" placeholder.
+// ─── Rapid-input debounce-merge (outbound forwarding leg only) ──────────────
+// When the user sends text then several files in quick succession, the text can
+// start a turn before the files arrive (idle-start race) and the files spill into
+// a second turn. The harness already merges fast follow-ups MID-turn; the only gap
+// is the idle start. A short per-chat debounce on the OUTBOUND forward closes it —
+// NOT a turn-blocking queue. Commands never reach the forward tail, so they're
+// never merged here.
+type PendingBatch = { contents: string[]; metas: Record<string, string>[]; timer: ReturnType<typeof setTimeout> }
+const pendingBatches = new Map<string, PendingBatch>()
+const MERGE_QUIET_MS = 600
 
-type LiveTail = {
+// ─── Live run card (per-turn activity surface) ──────────────────────────────
+// One persistent Feishu card per turn, decoupled from the reply tool. It tails
+// the session transcript and shows tool calls, skill loads, the latest finding,
+// a running clock and a ⏹ stop button, then finalizes (green done / red error /
+// grey interrupted) only when the TURN truly ends — the TUI goes idle, or a new
+// inbound (<channel …>) starts. This fixes two pains: mid-turn activity is now
+// visible and kept, and an intermediate "doc coming" reply no longer goes dark
+// (the reply is its own message; the card keeps tailing). The pure render/reduce
+// logic lives in run-card.ts (unit-tested by replaying real transcripts); this
+// file owns the stateful loop, the Feishu I/O and the TUI busy polling.
+
+type RunCard = {
+  cardId: string // the im message_id the card is shown in (matches card-action open_message_id)
+  entityId: string // the CardKit 2.0 card entity id — target of all card updates
+  seq: number // strictly-increasing per-card sequence for every cardkit update (300317 if it goes backwards)
+  marker: string
+  startedAt: number
+  projectDir: string
+  state: RunCardState
+  file: { path: string; offset: number } | null
+  remainder: string
+  lastKey: string
+  lastEditAt: number
+  edits: number
+  editFails: number
+  idleStreak: number
+  sawBusy: boolean
+  resumeAt: number // when a plan was just approved/cleared; suppresses idle-finalize during the execution spin-up window (0 = not resuming)
+  finalized: boolean
   stopped: boolean
-  inflight: Promise<void>
+  repaintHalted: boolean // ≥3 real edit failures: stop the high-freq heartbeat, but keep the card alive so finalize still lands the terminal PUT
   timer: ReturnType<typeof setInterval> | null
+  inflight: Promise<void>
 }
-const liveTails = new Map<string, LiveTail>()
-
-async function stopLiveProgress(chatId: string): Promise<void> {
-  const t = liveTails.get(chatId)
-  if (!t) return
-  t.stopped = true
-  if (t.timer) { clearInterval(t.timer); t.timer = null }
-  liveTails.delete(chatId)
-  try { await t.inflight } catch {}
-}
-
-function shortText(s: unknown, n = 64): string {
-  const str = String(s ?? '').replace(/\s+/g, ' ').trim()
-  return str.length > n ? str.slice(0, n) + '…' : str
-}
-
-// Human-readable elapsed time for the "I'm working, not frozen" clock.
-function fmtDur(ms: number): string {
-  const s = Math.floor(ms / 1000)
-  if (s < 60) return `${s}s`
-  const m = Math.floor(s / 60)
-  return `${m}m${s % 60}s`
-}
-
-function describeToolUse(name: string, input: unknown): string {
-  const i = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>
-  if (name === 'Bash') return `Bash：${shortText(i.description ?? i.command)}`
-  if (name === 'Read' || name === 'Edit' || name === 'Write')
-    return `${name}：${shortText(String(i.file_path ?? '').split('/').slice(-2).join('/'))}`
-  if (name === 'Grep' || name === 'Glob') return `${name}：${shortText(i.pattern)}`
-  if (name === 'WebSearch') return `搜索：${shortText(i.query)}`
-  if (name === 'WebFetch') return `网页：${shortText(i.url)}`
-  if (name === 'Agent' || name === 'Task') return `子任务：${shortText(i.description)}`
-  return name
-}
+const runCards = new Map<string, RunCard>()
+// Chats whose current turn the user asked to interrupt (⏹ button or /stop), so
+// the card loop finalizes as "interrupted" rather than "done".
+const interruptedChats = new Set<string>()
 
 // Find the transcript line containing `marker`; return the path and the byte
 // offset just past that line, so tailing starts at the turn's first action.
@@ -1032,109 +1095,344 @@ function findTranscript(projectDir: string, marker: string, sinceMs: number): { 
   return null
 }
 
-function startLiveProgress(chatId: string, thinkingId: string, marker: string): void {
-  void stopLiveProgress(chatId).then(() => {
-    const t: LiveTail = { stopped: false, inflight: Promise.resolve(), timer: null }
-    liveTails.set(chatId, t)
-    const startedAt = Date.now()
-    const projectDir = join(homedir(), '.claude', 'projects', getClaudeCwd().replace(/[^a-zA-Z0-9]/g, '-'))
-
-    let file: { path: string; offset: number } | null = null
-    let remainder = ''
-    const tools: { desc: string; done: boolean }[] = []
-    let narration = ''
-    let replying = false
-    let lastEditAt = 0
-    let lastBody = ''
-    let editFails = 0
-    let edits = 0
-
-    // The body (tool activity / narration) WITHOUT the clock. Kept separate so we
-    // can tell whether anything actually changed — the clock ticks every step, but
-    // we don't want a moving clock alone to burn the edit budget; a slower
-    // heartbeat refreshes it during long, quiet steps.
-    const renderBody = (): string => {
-      const lines: string[] = []
-      if (tools.length > 8) lines.push(`…（已完成 ${tools.length - 8} 步）`)
-      for (const tl of tools.slice(-8)) lines.push(`${tl.done ? '✓' : '▸'} ${tl.desc}`)
-      if (replying) lines.push('✍️ 正在写回复…')
-      else if (narration) lines.push(`💬 ${narration}`)
-      return lines.join('\n')
+async function startRunCard(chatId: string, marker: string): Promise<void> {
+  // One card per chat. Rapid follow-up messages queue into the SAME Claude turn,
+  // so if a card is already tracking this chat, keep it (just stop it idle-
+  // finalizing early) rather than stacking a second card or recalling the first.
+  // Stacking + recall is what made a fresh prompt's card vanish. A finalized card
+  // is already removed from the map, so the next message gets a clean new card.
+  const existing = runCards.get(chatId)
+  if (existing && !existing.finalized) {
+    existing.idleStreak = 0
+    connLog(`run card reuse: chat=${chatId}`)
+    return
+  }
+  interruptedChats.delete(chatId)
+  const now = Date.now()
+  // CardKit 2.0: create a card ENTITY, then send a message that references it. All
+  // later updates target the entity (PUT /cardkit/v1/cards/:id) with a strictly-
+  // increasing sequence — no 200-edit lifetime freeze, plus streaming + a smooth
+  // clock + collapsible tool panels. Keep both ids: entityId for updates, cardId
+  // (the message id) to match the card-action callback's open_message_id.
+  let entityId = ''
+  let cardId = ''
+  try {
+    const created = await larkApi('POST', '/cardkit/v1/cards', {
+      type: 'card_json',
+      data: JSON.stringify(renderRunCard(initRunCardState(), { startedAt: now, now, stopValue: { t: 'stop' } })),
+    })
+    entityId = created.data?.card_id ?? ''
+    if (entityId) {
+      const sent = await larkApi('POST', '/im/v1/messages?receive_id_type=chat_id', {
+        receive_id: chatId,
+        msg_type: 'interactive',
+        content: JSON.stringify({ type: 'card', data: { card_id: entityId } }),
+      })
+      cardId = sent.data?.message_id ?? ''
     }
+  } catch (err) {
+    process.stderr.write(`lark channel: run card create/send failed: ${err}\n`)
+  }
+  if (!entityId || !cardId) return
+  const projectDir = join(homedir(), '.claude', 'projects', getClaudeCwd().replace(/[^a-zA-Z0-9]/g, '-'))
+  const rc: RunCard = {
+    cardId, entityId, seq: 0, marker, startedAt: now, projectDir, state: initRunCardState(),
+    file: null, remainder: '', lastKey: '', lastEditAt: 0, edits: 0, editFails: 0,
+    idleStreak: 0, sawBusy: false, resumeAt: 0, finalized: false, stopped: false, repaintHalted: false,
+    timer: null, inflight: Promise.resolve(),
+  }
+  runCards.set(chatId, rc)
+  connLog(`run card start: chat=${chatId}`)
+  rc.timer = setInterval(() => {
+    rc.inflight = rc.inflight.then(() => stepRunCard(chatId, projectDir)).catch(() => {})
+  }, 1100)
+}
 
-    const ingest = (line: string): void => {
-      let entry: any
-      try { entry = JSON.parse(line) } catch { return }
-      const content = entry?.message?.content
-      if (!Array.isArray(content)) return
-      if (entry.type === 'assistant') {
-        for (const block of content) {
-          if (block?.type === 'tool_use' && typeof block.name === 'string') {
-            // Plan approval is handled by the pane-based plan watcher (it keys
-            // off the TUI dialog, which appears whether or not the model used
-            // the ExitPlanMode tool), so we don't special-case it here.
-            if (block.name.includes('reply')) { replying = true; continue }
-            tools.push({ desc: describeToolUse(block.name, block.input), done: false })
-          } else if (block?.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
-            narration = shortText(block.text, 80)
-          }
-        }
-      } else if (entry.type === 'user') {
-        if (content.some((b: any) => b?.type === 'tool_result')) {
-          for (const tl of tools) tl.done = true
-        }
-      }
-    }
+// True while the turn is paused on an interactive dialog (perm / askq / plan /
+// generic) the user still has to answer — the card must NOT finalize then, even
+// though the TUI status line is idle, because the turn resumes after the answer.
+function turnPausedOnDialog(pane: string): boolean {
+  const flat = pane.replace(/\s+/g, ' ')
+  if (flat.includes('Would you like to proceed') || flat.includes('Do you want to proceed') || flat.includes('use auto mode')) return true
+  return !!parseAskqDialog(pane) || !!parseGenericDialog(pane)
+}
 
-    const step = async (): Promise<void> => {
-      if (t.stopped) return
-      // The reply tool converted (or replaced) the placeholder — we're done.
-      if (pendingThinking.get(chatId) !== thinkingId) { void stopLiveProgress(chatId); return }
-      if (Date.now() - startedAt > 15 * 60_000) { void stopLiveProgress(chatId); return }
-      if (!file) {
-        // Keep ticking even before the transcript appears — the first message
-        // reads memory and can take 30-60s; don't look frozen during it.
-        file = findTranscript(projectDir, marker, startedAt)
-      }
-      if (file) {
-        let st
-        try { st = statSync(file.path) } catch { st = null }
-        if (st && st.size > file.offset) {
-          const fd = openSync(file.path, 'r')
-          const buf = Buffer.alloc(Math.min(st.size - file.offset, 1_048_576))
-          const n = readSync(fd, buf, 0, buf.length, file.offset)
-          closeSync(fd)
-          file.offset += n
-          const parts = (remainder + buf.toString('utf8', 0, n)).split('\n')
-          remainder = parts.pop() ?? ''
-          for (const line of parts) if (line.trim()) ingest(line)
-        }
-      }
-      const body = renderBody()
-      const clock = `⏳ 正在工作 · ${fmtDur(Date.now() - startedAt)}`
-      const rendered = body ? `${clock}\n${body}` : clock
-      // Slow the cadence down on long turns; hard-cap edits per message
-      // (Feishu rate limits, and a single message shouldn't be edited forever).
-      const interval = edits < 60 ? 1600 : edits < 120 ? 5000 : 10_000
-      const sinceEdit = Date.now() - lastEditAt
-      // Push when the body changed (real activity), or as an ~8s heartbeat so the
-      // clock keeps advancing through a single long step — the "not frozen" cue.
-      const due = sinceEdit >= interval && (body !== lastBody || sinceEdit >= 8000)
-      if (due && edits < 200 && !t.stopped) {
-        try {
-          await larkApi('PUT', `/im/v1/messages/${thinkingId}`, {
-            msg_type: 'text',
-            content: JSON.stringify({ text: rendered }),
-          })
-          lastBody = body; lastEditAt = Date.now(); edits++; editFails = 0
-        } catch {
-          if (++editFails >= 3) void stopLiveProgress(chatId)
+// Read any new transcript bytes for this run into its state. Position is tracked
+// on rc (offset + line remainder), so calling it repeatedly only ingests new
+// lines. Called both each poll and once more at finalize, so a fast turn whose
+// reply lands between the last poll and finalize still has its answer captured.
+function pumpTranscript(rc: RunCard): void {
+  if (!rc.file) {
+    rc.file = findTranscript(rc.projectDir, rc.marker, rc.startedAt)
+    if (rc.file) {
+      // Remember the bridge's own session id (filename minus .jsonl) so /mode can resume
+      // THIS session. findTranscript matched our injected marker, so it is our session.
+      const base = rc.file.path.split('/').pop() ?? ''
+      if (base.endsWith('.jsonl')) {
+        bridgeSessionId = base.slice(0, -'.jsonl'.length)
+        // Persist as the always-current id so a crash-relaunch can --resume this
+        // conversation (the supervisor reads last-session). Best-effort; a failed
+        // write just means the next crash starts fresh, the pre-existing behavior.
+        try { writeFileSync(LAST_SESSION_FILE, bridgeSessionId) } catch (err) {
+          connLog(`failed to persist last-session: ${err instanceof Error ? err.message : err}`)
         }
       }
     }
+  }
+  if (!rc.file) return
+  let st
+  try { st = statSync(rc.file.path) } catch { st = null }
+  if (!st || st.size <= rc.file.offset) return
+  const fd = openSync(rc.file.path, 'r')
+  const buf = Buffer.alloc(Math.min(st.size - rc.file.offset, 1_048_576))
+  const n = readSync(fd, buf, 0, buf.length, rc.file.offset)
+  closeSync(fd)
+  rc.file.offset += n
+  const parts = (rc.remainder + buf.toString('utf8', 0, n)).split('\n')
+  rc.remainder = parts.pop() ?? ''
+  for (const line of parts) {
+    if (!line.trim()) continue
+    let entry: any
+    try { entry = JSON.parse(line) } catch { continue }
+    ingestEntry(rc.state, entry)
+  }
+}
 
-    t.timer = setInterval(() => { t.inflight = t.inflight.then(step).catch(() => {}) }, 1100)
-  })
+async function stepRunCard(chatId: string, projectDir: string): Promise<void> {
+  const rc = runCards.get(chatId)
+  if (!rc || rc.stopped) return
+
+  if (interruptedChats.has(chatId)) { interruptedChats.delete(chatId); await finalizeRunCard(chatId, 'interrupted'); return }
+  // 45-min hard timeout — but NOT while a plan is pending approval: a human may
+  // take a while to review, and timing out there would strip the 批准/取消 buttons
+  // while the TUI is still blocked on the dialog (BUG-6). CardKit 2.0 removed the
+  // 200-edit freeze, so a long-but-legit turn can run far past the old 15-min cap;
+  // a real hung-turn watchdog (working vs wedged) is a later increment.
+  if (!rc.state.planMd && Date.now() - rc.startedAt > 45 * 60_000) { await finalizeRunCard(chatId, 'timeout'); return }
+
+  // Tail new transcript bytes into the run state.
+  pumpTranscript(rc)
+
+  // Interrupt marker in the tail → the turn was stopped. We intentionally do NOT
+  // finalize on a later <channel> inbound: rapid messages queue into one Claude
+  // turn, so a second inbound is more work to show, not a turn boundary (treating
+  // it as one recalled a live card). Idle is the real turn-end signal.
+  if (rc.state.interrupted) { await finalizeRunCard(chatId, 'interrupted'); return }
+
+  // A terminal API error (content filter / overload / expired auth) was written to the
+  // transcript — the turn died, no answer follows. Finalize red so a failed turn never
+  // shows the green ✅ 完成 header (a 2026-06-15 content-filter turn did exactly that).
+  // pumpTranscript ran above, so a real answer in the same batch already cleared the
+  // flag (recovery) before this check.
+  if (rc.state.apiError) { await finalizeRunCard(chatId, 'error'); return }
+
+  // Idle finalize: TUI genuinely idle AND not paused on a dialog. Guard against
+  // the pre-busy window and a too-fast turn with idleStreak + a grace period.
+  const pane = tmuxReachable() ? paneText() : ''
+  if (pane.includes(BUSY_MARKER)) {
+    rc.sawBusy = true
+    rc.idleStreak = 0
+  } else if (turnPausedOnDialog(pane)) {
+    rc.idleStreak = 0
+  } else {
+    rc.idleStreak++
+    const grace = Date.now() - rc.startedAt > 10_000
+    // Just resumed from plan approval: post-approval execution takes a beat to
+    // surface the busy marker, and the empty-card guard doesn't help here (planning
+    // already produced blocks + sawBusy). Without this window the card would
+    // finalize 'done' in the spin-up gap and the execution + answer would run
+    // untracked → escape as a separate message (BUG-1). resumeAt=0 for normal
+    // turns, so this only affects the post-approve transition.
+    const inResumeGrace = rc.resumeAt > 0 && Date.now() - rc.resumeAt < 8000
+    // Don't finalize while the card is still empty: a fresh card can catch an
+    // idle blip in the busy-handoff window (a prior interrupted turn ending, or a
+    // queued message not yet dequeued) BEFORE its own turn produces anything. If
+    // we finalized there, the real work would run untracked and its answer would
+    // escape as a separate message (an empty-card-finalize bug). Wait for real content; a
+    // genuinely no-op turn is closed by the 15-min timeout instead.
+    if (rc.idleStreak >= 3 && (rc.sawBusy || grace) && rc.state.blocks.length > 0 && !inResumeGrace) { await finalizeRunCard(chatId, 'done'); return }
+  }
+
+  // Re-render when content changed, or on a ~2s clock heartbeat so the timer keeps
+  // moving smoothly. CardKit 2.0 has no per-card lifetime cap (only 10 QPS), so the
+  // old 1.0 200-edit freeze is gone — a long turn keeps ticking. repaintRunCard
+  // does the cardkit PUT + sequence + bookkeeping; we just decide when, and stop
+  // hammering after repeated hard failures (a wedged connection).
+  const renderNow = Date.now()
+  const key = runCardKey(rc.state)
+  const sinceEdit = renderNow - rc.lastEditAt
+  const due = key !== rc.lastKey || sinceEdit >= 2000
+  if (due && !rc.repaintHalted) {
+    await repaintRunCard(rc)
+    // ≥3 REAL edit failures (stale-seq doesn't count — see repaintRunCard): the
+    // connection is wedged. Stop the high-frequency repaint PUTs so we don't hammer a
+    // dead channel — but DON'T delete the card or clear the timer. The loop keeps
+    // running (transcript pump + idle/interrupt/timeout detection) so finalizeRunCard
+    // still fires at the turn's end and lands the terminal PUT (the connection may
+    // well have recovered by then). Without this, a brief QPS breach would freeze the
+    // card on ⏳ forever. repaintHalted gates the heartbeat above, not the loop.
+    if (rc.editFails >= 3 && !rc.repaintHalted) {
+      rc.repaintHalted = true
+      connLog(`run card repaint halted (editFails=${rc.editFails}); loop continues, finalize will still attempt terminal PUT`)
+    }
+  }
+}
+
+async function finalizeRunCard(chatId: string, terminal: Terminal): Promise<void> {
+  const rc = runCards.get(chatId)
+  if (!rc || rc.finalized) return
+  rc.finalized = true
+  rc.stopped = true
+  if (rc.timer) { clearInterval(rc.timer); rc.timer = null }
+  // The card is gone — clear the module-global plan-dialog latches so a later turn's
+  // plan can re-arm them (otherwise planDialogShown could stay true across turns and
+  // the next plan would never surface on its run card; RACE-5).
+  if (rc.state.planMd) { planDialogShown = false; replanPending = false }
+  // Final tail read: a fast turn can go idle a beat after the reply is written, so
+  // catch any last entries (the answer) before we render the closed card. Without
+  // this a 5s Q&A could finalize with an empty card (the empty-card-finalize bug).
+  if (terminal !== 'interrupted') { try { pumpTranscript(rc) } catch {} }
+  rc.state.terminal = terminal
+  markToolsResolved(rc.state, terminal)
+  connLog(`run card finalize: ${terminal} (${rc.state.blocks.length} blocks, ${fmtDur(Date.now() - rc.startedAt)})`)
+
+  // Answer-delivery safety net. For a tracked turn the answer lives ONLY in the card
+  // (the reply tool no longer posts it separately), so the card landing is what gets
+  // it to the user. Two failure modes must not silently drop the answer:
+  const answer = finalAnswerText(rc.state)
+  let answerDelivered = false
+
+  // (b) The model finished a turn with a final assistant TEXT answer but never called
+  // the `reply` tool (replied === false). The system prompt says it must, but that's
+  // not enforced — so the answer never went out as a message. On a genuinely completed
+  // turn, push it as a normal Feishu message. Gated to 'done' so an interrupted/timeout
+  // turn doesn't ship a half-written block.
+  if (terminal === 'done' && !rc.state.replied && answer) {
+    await sendAnswerMessage(chatId, answer)
+    answerDelivered = true
+    connLog('run card finalize: model never called reply — answer sent as fallback message')
+  }
+
+  // (c) The answer went out via reply but the card render truncated it to a preview
+  // (> MAX_TEXT). The card is a status surface, not a long-text delivery channel — send
+  // the FULL answer as a normal chunked message so nothing is lost. Plain text so code
+  // blocks survive literally. Mutually exclusive with (b) and the PUT-failure fallback
+  // via answerDelivered. Short answers (the common case) take the unchanged card-only path.
+  if (terminal === 'done' && !answerDelivered && answer && answer.length > MAX_TEXT) {
+    await sendAnswerMessage(chatId, '完整答案见下：\n\n' + answer)
+    answerDelivered = true
+    connLog(`run card finalize: answer ${answer.length} chars > ${MAX_TEXT} — full answer sent as chunked message`)
+  }
+
+  // Final 2.0 update (terminal render) + turn streaming_mode off so the card settles
+  // (interaction callbacks/forwarding re-enabled). finalize bumps the sequence last,
+  // so even if a heartbeat repaint is mid-flight its lower seq is rejected (300317,
+  // harmless) and this terminal state is the one that sticks. Logged: a silent
+  // failure here would look like "the card didn't change".
+  if (rc.entityId) {
+    try {
+      // Final terminal render. No settings/streaming_mode toggle this increment —
+      // the card is never in streaming_mode (see run-card.ts), so there is nothing
+      // to settle. The typewriter increment will set streaming_mode:true while
+      // running + add a settings streaming_mode:false here to settle the card, with
+      // the failure LOGGED (not swallowed).
+      await larkApi('PUT', `/cardkit/v1/cards/${rc.entityId}`, {
+        card: { type: 'card_json', data: JSON.stringify(renderRunCard(rc.state, { startedAt: rc.startedAt, now: Date.now() })) },
+        sequence: ++rc.seq,
+      })
+    } catch (err) {
+      // Stale-seq here is benign and EXPECTED (a mid-flight heartbeat with a higher
+      // seq already landed the latest state) — don't treat it as a lost answer.
+      if (isStaleSeq(err)) {
+        connLog(`run card finalize stale-seq (code=${err.code}) — terminal state already current`)
+      } else {
+        connLog(`run card finalize update failed: ${terminal}: ${err instanceof Error ? err.message : err}`)
+        // (a) The terminal PUT failed for real → the answer is stranded in a card that
+        // will never repaint (frozen ⏳). Fall back to delivering it as a normal chunked
+        // message so the user still gets it. Skip if 4(b) already sent it.
+        if (!answerDelivered && answer) {
+          await sendAnswerMessage(chatId, answer)
+          connLog('run card finalize: PUT failed — answer delivered as fallback message')
+        }
+      }
+    }
+  }
+  runCards.delete(chatId)
+}
+
+// True when an active (not-yet-finalized) run card is tracking this chat's turn.
+// When true, the reply tool's answer is already captured by the card (read from
+// the transcript in native order — one message, never lost to a race), so the
+// reply handler must NOT also post it as a separate message. False (e.g. a reply
+// outside any tracked turn) → the handler falls back to a normal chat message.
+function runCardActive(chatId: string): boolean {
+  const rc = runCards.get(chatId)
+  return !!rc && !rc.finalized
+}
+
+// Render + PATCH the run card from its CURRENT state, with bookkeeping. Always run
+// this through rc.inflight (the same chain stepRunCard uses) so plan set/clear and
+// the heartbeat never race two PATCHes on one message or clobber each other's
+// lastKey/lastEditAt (RACE-1/2/4). Plan view ignores stopValue; running view shows it.
+async function repaintRunCard(rc: RunCard): Promise<void> {
+  if (rc.finalized || !rc.entityId) return
+  const now = Date.now()
+  const running = rc.state.terminal === 'running' && !rc.state.planMd
+  try {
+    // Full-card update on the 2.0 entity (structural changes: new tools, header,
+    // buttons, plan view). Sequence must strictly increase across every update; all
+    // repaints serialize on rc.inflight so ++rc.seq stays monotonic. finalize takes
+    // the highest seq (it bumps last, after setting finalized so repaints bail).
+    await larkApi('PUT', `/cardkit/v1/cards/${rc.entityId}`, {
+      card: { type: 'card_json', data: JSON.stringify(renderRunCard(rc.state, { startedAt: rc.startedAt, now, stopValue: running ? { t: 'stop' } : undefined })) },
+      sequence: ++rc.seq,
+    })
+    rc.lastKey = runCardKey(rc.state); rc.lastEditAt = now; rc.edits++; rc.editFails = 0
+  } catch (err) {
+    // Stale-seq (300317/230001) is harmless — a lower-seq repaint lost the race to a
+    // higher one. It is NOT a transport failure, so it must NOT count toward editFails
+    // (which would abandon a healthy card during a tool-heavy, high-QPS turn).
+    if (isStaleSeq(err)) {
+      connLog(`run card update stale-seq (seq=${rc.seq}, code=${err.code}) — ignored`)
+      return
+    }
+    rc.editFails++
+    connLog(`run card update failed (seq=${rc.seq}, fails=${rc.editFails}): ${err instanceof Error ? err.message : err}`)
+  }
+}
+
+// Plan-approval ON the run card (unified): when the turn pauses on
+// a plan dialog, hold the plan on the active run card so it grows the 批准/取消
+// buttons — one card, no second plan card, no finalize race. Returns true if a run
+// card took the plan (caller then skips the separate plan card). State mutation is
+// synchronous; the repaint is enqueued on rc.inflight so it serializes with the loop.
+function setRunCardPlan(chatId: string, planMd: string): boolean {
+  const rc = runCards.get(chatId)
+  if (!rc || rc.finalized) return false
+  rc.state.planMd = planMd
+  rc.idleStreak = 0 // awaiting approval — must not idle-finalize while a plan is pending
+  rc.inflight = rc.inflight.then(() => repaintRunCard(rc)).catch(() => {})
+  return true
+}
+
+// Clear the plan from the run card → it resumes the normal running render and tails
+// the post-approval execution + final answer (one card, no execution notice). Resets
+// sawBusy + stamps resumeAt so a slow execution spin-up can't trip idle-finalize in
+// the handoff window (BUG-1).
+function clearRunCardPlan(chatId: string): void {
+  const rc = runCards.get(chatId)
+  if (!rc || rc.finalized || !rc.state.planMd) return
+  rc.state.planMd = null
+  rc.idleStreak = 0
+  rc.sawBusy = false
+  rc.resumeAt = Date.now()
+  rc.inflight = rc.inflight.then(() => repaintRunCard(rc)).catch(() => {})
+}
+
+// Whether the active run card is currently showing a plan awaiting approval.
+function runCardPlanActive(chatId: string): boolean {
+  const rc = runCards.get(chatId)
+  return !!rc && !rc.finalized && !!rc.state.planMd
 }
 
 // ─── Plan-approval dialog watcher ─────────────────────────────────────────────
@@ -1145,6 +1443,11 @@ function startLiveProgress(chatId: string, thinkingId: string, marker: string): 
 // newest plan file for content, and present the approval card. Idempotent via
 // planDialogShown, which resets when the dialog clears.
 let planDialogShown = false
+// True between a user-initiated revise (which transiently closes the plan dialog
+// while Claude re-plans) and the new plan dialog appearing. While set, the watcher
+// HOLDS the old plan view across the gap (no flicker). While unset, a closed plan
+// dialog means the plan was abandoned/self-cancelled → drop the stale plan view.
+let replanPending = false
 let permDialogShown = false
 // AskUserQuestion picker: tracked by question signature (not a bare bool) so a
 // multi-question prompt re-surfaces each question as the TUI advances.
@@ -1192,7 +1495,7 @@ function parsePermDialog(pane: string): PermDialog | null {
 
 function permCard(dlg: PermDialog): unknown {
   return {
-    config: { wide_screen_mode: true },
+    config: { wide_screen_mode: true, update_multi: true },
     header: { template: 'turquoise', title: { tag: 'plain_text', content: '🔐 需要授权' } },
     elements: [
       { tag: 'div', text: { tag: 'lark_md', content: '```\n' + dlg.context.slice(0, 800) + '\n```' } },
@@ -1208,7 +1511,6 @@ function permCard(dlg: PermDialog): unknown {
 }
 
 async function presentPerm(chatId: string, dlg: PermDialog): Promise<void> {
-  await stopLiveProgress(chatId)
   const thinkingId = pendingThinking.get(chatId)
   if (thinkingId) {
     pendingThinking.delete(chatId)
@@ -1288,7 +1590,7 @@ function parseAskqDialog(pane: string): AskqDialog | null {
 
 function askqCard(dlg: AskqDialog): unknown {
   return {
-    config: { wide_screen_mode: true },
+    config: { wide_screen_mode: true, update_multi: true },
     header: { template: 'blue', title: { tag: 'plain_text', content: `❓ ${dlg.header || '需要你选择'}`.slice(0, 60) } },
     elements: [
       { tag: 'div', text: { tag: 'lark_md', content: dlg.question || '请选择一个选项：' } },
@@ -1305,7 +1607,6 @@ function askqCard(dlg: AskqDialog): unknown {
 }
 
 async function presentAskq(chatId: string, dlg: AskqDialog): Promise<void> {
-  await stopLiveProgress(chatId)
   const thinkingId = pendingThinking.get(chatId)
   if (thinkingId) {
     pendingThinking.delete(chatId)
@@ -1348,7 +1649,7 @@ function parseGenericDialog(pane: string): GenericDialog | null {
 
 function genericCard(dlg: GenericDialog): unknown {
   return {
-    config: { wide_screen_mode: true },
+    config: { wide_screen_mode: true, update_multi: true },
     header: { template: 'wathet', title: { tag: 'plain_text', content: '❔ Claude 在问你' } },
     elements: [
       { tag: 'div', text: { tag: 'lark_md', content: dlg.prompt || '终端弹出了一个选择，请选一项：' } },
@@ -1364,7 +1665,6 @@ function genericCard(dlg: GenericDialog): unknown {
 }
 
 async function presentGeneric(chatId: string, dlg: GenericDialog): Promise<void> {
-  await stopLiveProgress(chatId)
   const thinkingId = pendingThinking.get(chatId)
   if (thinkingId) {
     pendingThinking.delete(chatId)
@@ -1394,12 +1694,26 @@ function startDialogWatcher(): void {
     if (atPlanDialog && !planDialogShown) {
       if (chatId) {
         planDialogShown = true
-        const thinkingId = pendingThinking.get(chatId)
-        void stopLiveProgress(chatId)
-        void presentPlan(chatId, newestPlanText(), thinkingId)
+        replanPending = false // the (new) plan dialog is up — the regen gap is over
+        // Unified card: show the plan ON the run card (it grows the
+        // 批准/取消 buttons). setRunCardPlan returns false only when there's no run
+        // card to host it → fall back to a separate plan card (BUG-5: gate the
+        // fallback on the return, not a separate check).
+        if (!setRunCardPlan(chatId, planToLarkMd(newestPlanText()))) {
+          void presentPlan(chatId, newestPlanText(), pendingThinking.get(chatId))
+        }
       }
     } else if (!atPlanDialog && planDialogShown) {
       planDialogShown = false
+      // A user revise transiently closes the dialog while Claude re-plans — HOLD the
+      // old plan view across that gap so it doesn't flicker plan→running→plan
+      // (RACE-3); the new plan replaces it when its dialog appears. But if the dialog
+      // closed with NO revise pending, the plan was abandoned/self-cancelled and the
+      // turn is continuing — drop the stale plan view so dead buttons don't linger
+      // (regression-e). approve/cancel still clear/finalize explicitly.
+      // (skip if an interrupt is pending — cancel/stop will finalize grey; clearing
+      // here would flicker the card to 'running' first.)
+      if (!replanPending && chatId && !interruptedChats.has(chatId) && runCardPlanActive(chatId)) clearRunCardPlan(chatId)
     }
 
     if (atPermDialog && !permDialogShown) {
@@ -1434,6 +1748,19 @@ function startDialogWatcher(): void {
 // the real keystrokes into the tmux session running this Claude Code session.
 const TMUX_SESSION = process.env.LARK_TMUX_SESSION ?? 'bridge'
 const MODE_FILE = `${process.env.HOME}/.claude/channels/lark/launch-mode`
+// /mode switches permission mode but KEEPS the conversation by resuming the SAME
+// claude session. The lark server writes the bridge's own session id here; the
+// supervisor reads it, adds --resume <id> to the next relaunch, then clears it (used
+// once, so a failed resume self-heals to fresh next loop). bridgeSessionId is captured
+// from the transcript the run card tails — matched by the bridge's injected marker, so
+// it is reliably THIS session, never another one sharing the project dir.
+const RESUME_FILE = `${process.env.HOME}/.claude/channels/lark/resume-session`
+// Always-current bridge session id, distinct from the one-shot RESUME_FILE (which is
+// written only by a deliberate /mode keep-context and deleted after one use). The
+// supervisor reads this on a crash-relaunch to --resume the conversation instead of
+// losing it (OOM/segfault/context-overflow). Persisted on every bridgeSessionId capture.
+const LAST_SESSION_FILE = `${process.env.HOME}/.claude/channels/lark/last-session`
+let bridgeSessionId = ''
 
 // chat_id -> timestamp of when we asked for a permission mode; reply valid 2 min.
 const awaitingMode = new Map<string, number>()
@@ -1450,6 +1777,24 @@ function notifyChat(chatId: string, text: string) {
     msg_type: 'text',
     content: JSON.stringify({ text }),
   }).catch(() => {})
+}
+
+// Send an answer to a chat as one or more normal chunked text messages (same
+// chunking the reply tool uses). The answer-delivery safety net: when the finalize
+// card PUT fails, or the model produced final text but never called reply, the user
+// must still get the answer instead of a frozen ⏳ card. Best-effort per chunk.
+async function sendAnswerMessage(chatId: string, text: string): Promise<void> {
+  if (!text.trim()) return
+  const access = loadAccess()
+  const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
+  const mode = access.chunkMode ?? 'length'
+  for (const part of chunk(text, limit, mode)) {
+    await larkApi('POST', '/im/v1/messages?receive_id_type=chat_id', {
+      receive_id: chatId,
+      msg_type: 'text',
+      content: JSON.stringify({ text: part }),
+    }).catch(err => connLog(`answer fallback chunk failed: ${err instanceof Error ? err.message : err}`))
+  }
 }
 
 function tmuxReachable(): boolean {
@@ -1615,6 +1960,31 @@ function parseControlCommand(text: string): { keystrokes: string; label: string 
 
 async function runControlCommand(chatId: string, ctrl: { keystrokes: string; label: string }): Promise<void> {
   try {
+    // /help — never goes to the TUI (its output is a terminal-shaped menu the phone
+    // user can't act on). Reply with what actually works from a phone, plainly.
+    if (/^\/help\b/i.test(ctrl.keystrokes)) {
+      await notifyChat(chatId,
+        '👋 在这儿能做什么：\n\n' +
+        '· 正常打字就能聊\n' +
+        '· 发图、文件、语音，直接发就行\n\n' +
+        '命令：\n' +
+        '/new — 开一个新对话（会让你选模式）\n' +
+        '/clear — 清空当前对话\n' +
+        '/stop — 打断正在跑的这一回合\n' +
+        '/compact — 整理压缩一下上下文\n' +
+        '/context — 看看上下文用了多少\n' +
+        '/mode — 切权限模式（保留当前对话）\n' +
+        '/model — 换个模型')
+      return
+    }
+
+    // /effort is a launch flag, not a TUI command — passing it through silently does
+    // nothing while telling the user "已发送". Intercept and say so plainly.
+    if (/^\/effort\b/i.test(ctrl.keystrokes)) {
+      await notifyChat(chatId, 'ℹ️ 这个桥不支持中途切 effort,它固定在启动时的级别。')
+      return
+    }
+
     if (!tmuxReachable()) {
       throw new Error(`tmux session "${TMUX_SESSION}" 不可达 — 请用 bridge-supervisor.sh 启动`)
     }
@@ -1623,11 +1993,19 @@ async function runControlCommand(chatId: string, ctrl: { keystrokes: string; lab
     // "/stop" would just be sent as text — so we press the interrupt key (Esc)
     // instead, and report what actually happened by watching the busy marker.
     if (/^\/stop\b/i.test(ctrl.keystrokes)) {
-      const wasBusy = tuiBusy()
+      // A pending plan dialog (or any dialog) is "running" too, even though it
+      // doesn't show the busy marker — treat it as interruptible so /stop cancels
+      // the plan AND the run card finalizes grey "已中断" rather than reporting
+      // "nothing running" and silently leaving the card to idle into 'done' (BUG-2).
+      const planPending = runCardPlanActive(chatId) || turnPausedOnDialog(paneText())
+      const wasBusy = tuiBusy() || planPending
+      if (wasBusy) interruptedChats.add(chatId)
       spawnSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Escape'])
       await delay(900)
       if (!wasBusy) {
         await notifyChat(chatId, 'ℹ️ 当前没有正在运行的回合，没什么可中断的。')
+      } else if (planPending) {
+        await notifyChat(chatId, '⏹ 已取消待审方案。')
       } else if (!tuiBusy()) {
         await notifyChat(chatId, '⏹ 已中断当前回合。')
       } else {
@@ -1658,6 +2036,33 @@ async function runControlCommand(chatId: string, ctrl: { keystrokes: string; lab
       return
     }
 
+    // /clear wipes the whole conversation, silently — and from chat the old ack was the
+    // ambiguous no-echo fallback, so a user (especially mom) couldn't tell it had
+    // happened. It already executed (typed + Enter above); replace the ack with an
+    // explicit, plain confirmation that context is gone and a fresh one has started.
+    if (/^\/clear\b/i.test(ctrl.keystrokes)) {
+      await notifyChat(chatId, '🧹 已清空当前对话,从这里开始是全新上下文(之前的内容不再保留)。')
+      return
+    }
+
+    // /context renders a usage chart + a long per-source tool/skill/built-in inventory
+    // (~70 lines). On a phone only the usage summary matters, so capture it and cut the
+    // inventory (everything from the "MCP tools" listing on) → a glanceable summary, not
+    // a wall. Falls back to the full text if the marker isn't found (graceful).
+    if (/^\/context\b/i.test(ctrl.keystrokes)) {
+      await waitPaneStable(4000)
+      const out = captureCommandOutput(ctrl.keystrokes)
+      if (out) {
+        let t = out.text
+        const cut = t.search(/(^|\n)\s*MCP tools\b/)
+        if (cut > 0) t = t.slice(0, cut).trimEnd()
+        await sendCommandOutput(chatId, ctrl.label, t)
+      } else {
+        await notifyChat(chatId, '⚠️ 没读到 /context 的输出,请在终端查看。')
+      }
+      return
+    }
+
     // Mirror the terminal: wait for the command to render, then surface whatever
     // it put on screen. A numbered picker (/model, /agents…) is left to the dialog
     // watcher — it'll send a tappable card, so we don't double-handle it here.
@@ -1672,7 +2077,11 @@ async function runControlCommand(chatId: string, ctrl: { keystrokes: string; lab
       if (out.modal) spawnSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Escape'])
       await sendCommandOutput(chatId, ctrl.label, out.text)
     } else {
-      await notifyChat(chatId, `⚙️ 已执行 ${ctrl.label}`)
+      // No captured output: the command was typed into the TUI but produced no echo
+      // we could read back — most often a typo or a command that doesn't work from
+      // a phone. The end user has no terminal, so don't point them at one; tell them
+      // it's unavailable here and where to find what does work.
+      await notifyChat(chatId, '这个命令在手机上用不了。发 /help 看看能用哪些。')
     }
   } catch (err) {
     await notifyChat(chatId, `⚠️ ${ctrl.label} 失败：${err instanceof Error ? err.message : err}`)
@@ -1716,13 +2125,42 @@ async function startNewSession(chatId: string, modeArg?: string): Promise<void> 
   await relaunchInMode(chatId, mode)
 }
 
-async function relaunchInMode(chatId: string, mode: string): Promise<void> {
+// /mode entry point: switch permission mode while keeping the conversation. A bad or
+// empty arg gets honest usage text — better than the old silent no-op (passthrough).
+async function switchMode(chatId: string, arg?: string): Promise<void> {
+  const mode = normalizeMode(arg)
+  if (!mode) {
+    await notifyChat(chatId, '⚙️ 用法:/mode plan | bypass | default | acceptEdits —— 切换权限模式并保留当前对话。')
+    return
+  }
+  await relaunchInMode(chatId, mode, true) // keepContext: resume the same session
+}
+
+async function relaunchInMode(chatId: string, mode: string, keepContext = false): Promise<void> {
   try {
     if (!tmuxReachable()) {
       throw new Error(`tmux session "${TMUX_SESSION}" 不可达 — 请用 bridge-supervisor.sh 启动`)
     }
     writeFileSync(MODE_FILE, mode)
-    await notifyChat(chatId, `🔄 正在重启到 ${mode} 模式（约 10 秒后可继续发消息）…`)
+    // /mode keeps context: ask the supervisor to --resume THIS session on relaunch.
+    // /new (keepContext=false), and the fallback when no turn has run yet so we don't
+    // know our session id, clears the request so it starts fresh. A stale/failed resume
+    // self-heals to fresh on the next supervisor loop (the file is used once).
+    const resuming = keepContext && !!bridgeSessionId
+    if (resuming) {
+      writeFileSync(RESUME_FILE, bridgeSessionId)
+    } else {
+      rmSync(RESUME_FILE, { force: true })
+      // Fresh session requested (/new, or the no-id fallback): also drop the
+      // always-current crash-resume id. Otherwise the supervisor — finding no
+      // RESUME_FILE but a populated last-session — would --resume the OLD
+      // conversation on this deliberate relaunch, silently breaking /new's "start
+      // fresh". A real crash leaves last-session intact, so crash-resume still works.
+      rmSync(LAST_SESSION_FILE, { force: true })
+    }
+    await notifyChat(chatId, resuming
+      ? `🔄 正在切到 ${mode} 模式(保留当前对话,约 10 秒后可继续)…`
+      : `🔄 正在切到 ${mode} 模式(开新会话,约 10 秒后可继续)…`)
     await delay(300)
     // A modal dialog (plan approval / tool permission) may be open and would
     // swallow the /quit keystrokes — dismiss it and clear the input first.
@@ -1730,12 +2168,16 @@ async function relaunchInMode(chatId: string, mode: string): Promise<void> {
     await delay(200)
     spawnSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'C-u'])
     await delay(150)
-    // Quit Claude; the supervisor loop relaunches it with --permission-mode <mode>.
+    // Quit Claude; the supervisor loop relaunches with --permission-mode <mode> (and
+    // --resume <id> if we asked to keep context).
     if (!(await typeIntoTui('/quit'))) throw new Error('无法键入 /quit')
     await delay(150)
     spawnSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Enter'])
+    // The session is ending; forget the id so a later /mode (before the next turn
+    // re-captures it) can't resume a stale session — it falls back to fresh instead.
+    bridgeSessionId = ''
   } catch (err) {
-    await notifyChat(chatId, `⚠️ 重启失败：${err instanceof Error ? err.message : err}`)
+    await notifyChat(chatId, `⚠️ 重启失败:${err instanceof Error ? err.message : err}`)
   }
 }
 
@@ -1771,7 +2213,7 @@ function modeCard(): unknown {
     '**🔍 default** — 每一步都先问你\n' +
     '**✏️ acceptEdits** — 自动改文件，其余照问'
   return {
-    config: { wide_screen_mode: true },
+    config: { wide_screen_mode: true, update_multi: true },
     header: {
       template: 'blue',
       title: { tag: 'plain_text', content: '🆕 新会话 · 选权限模式' },
@@ -1793,7 +2235,7 @@ function modeCard(): unknown {
 
 function chosenCard(mode: string): unknown {
   return {
-    config: { wide_screen_mode: true },
+    config: { wide_screen_mode: true, update_multi: true },
     elements: [
       { tag: 'div', text: { tag: 'lark_md', content: `✅ 已选 **${MODE_LABELS[mode] ?? mode}**，正在重启…` } },
     ],
@@ -1824,7 +2266,7 @@ async function sendModeCard(chatId: string): Promise<boolean> {
 // tool input, captured by the transcript tailer.
 
 function noticeCard(text: string): unknown {
-  return { config: { wide_screen_mode: true }, elements: [{ tag: 'div', text: { tag: 'lark_md', content: text } }] }
+  return { config: { wide_screen_mode: true, update_multi: true }, elements: [{ tag: 'div', text: { tag: 'lark_md', content: text } }] }
 }
 
 // lark_md in cards renders **bold** and links but not # headings or - bullets.
@@ -1852,7 +2294,7 @@ function planToLarkMd(plan: string): string {
 
 function planCard(plan: string): unknown {
   return {
-    config: { wide_screen_mode: true },
+    config: { wide_screen_mode: true, update_multi: true },
     header: { template: 'orange', title: { tag: 'plain_text', content: '📋 方案待审核' } },
     elements: [
       { tag: 'div', text: { tag: 'lark_md', content: planToLarkMd(plan) || '(无方案内容)' } },
@@ -1941,6 +2383,7 @@ async function reviseViaPlanDialog(chatId: string, feedback: string): Promise<vo
   await delay(350)
   if (freeTextFieldReady(optNum, label, oneLine)) {
     spawnSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Enter']) // submit → re-plan
+    replanPending = true // a new plan is coming — watcher holds the old plan view across the regen gap (no flicker)
     await notifyChat(chatId, '✏️ 收到，已把你的修改发给 Claude，正在按意见重新规划…')
   } else {
     spawnSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Escape']) // dismiss without approving
@@ -2026,6 +2469,18 @@ async function handleCardAction(event: any): Promise<undefined> {
       // Fire-and-forget: ack the WS callback immediately. Feishu retries a slow
       // callback (>~3s) and that double-fires the click; the tmux work (which
       // polls for up to ~10s) must not block the return.
+      // Unified: when the plan lives ON the run card, the clicked
+      // card IS the run card — approve/cancel must NOT overwrite it with a notice
+      // card; they drop the plan view so the card resumes and tails execution.
+      // Unified ONLY when the CLICKED card is the run card itself (identity, not just
+      // chat-global plan state) — else a click on a stale separate plan card would
+      // drive the unrelated run card's plan and leave the clicked card stale (BUG-3).
+      const rcForCard = runCards.get(chatId)
+      const unified = !!rcForCard && !rcForCard.finalized && !!rcForCard.state.planMd && rcForCard.cardId === messageId
+      // The plan dialog is detected by the watcher via "use auto mode"; the question
+      // line is "Would you like to proceed". Accept EITHER signature so a Claude Code
+      // wording change to one line can't make approve un-confirmable (BUG-4).
+      const planDialogUp = () => paneFlat().includes('Would you like to proceed') || paneFlat().includes('use auto mode')
       void (async () => {
         if (value.a === 'approve') {
           // The plan dialog may not be rendered yet (plan still generating) or
@@ -2034,25 +2489,33 @@ async function handleCardAction(event: any): Promise<undefined> {
           // dialog and silently no-op'd.
           let confirmed = false
           for (let i = 0; i < 8 && !confirmed; i++) {
-            if (paneFlat().includes('Would you like to proceed')) {
+            if (planDialogUp()) {
               spawnSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Enter']) // confirm "Yes, auto mode"
               await delay(1200)
-              if (!paneFlat().includes('Would you like to proceed')) confirmed = true
+              if (!planDialogUp()) confirmed = true
             } else {
               await delay(1200)
             }
           }
-          connLog(`plan approve: confirmed=${confirmed}`)
+          connLog(`plan approve: confirmed=${confirmed} unified=${unified}`)
+          if (unified) {
+            if (!confirmed) {
+              // Leave the plan view up so the user can retry; notify out-of-band
+              // rather than overwriting the run card.
+              await notifyChat(chatId, '⚠️ 没能确认方案（终端没接住批准）。再点一次「批准执行」，或在终端处理。')
+              return
+            }
+            // Drop the plan view → the run card resumes and tails the execution +
+            // final answer. One card, no execution notice, no second tracker.
+            clearRunCardPlan(chatId)
+            return
+          }
+          // Fallback: plan was shown on a SEPARATE plan card (no run card). Track
+          // execution on that card the old way.
           if (!confirmed) {
             await editCard('⚠️ 没找到待审方案（可能已处理或已超时）。')
             return
           }
-          // Approve worked — now keep the card alive through execution. The post-
-          // approval turn isn't a channel message, so the transcript-tailing live
-          // progress (which keys off a message_id) can't attach to it; instead we
-          // poll the TUI busy marker and tick the card. This closes the "approve
-          // did nothing" gap: the button worked, the silence during the run was
-          // the problem. The actual result still lands as a normal reply at the end.
           const t0 = Date.now()
           await editCard('✅ 已批准，正在执行…')
           await delay(2500) // let the turn spin up so the busy marker appears
@@ -2072,10 +2535,18 @@ async function handleCardAction(event: any): Promise<undefined> {
           }
           await editCard(sawBusy ? '✅ 执行完成（结果见下方回复）。' : '✅ 已批准。')
         } else if (value.a === 'revise') {
-          spawnSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Escape']) // dismiss dialog, stay in plan mode
+          spawnSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Escape']) // dismiss dialog
           await delay(200)
           spawnSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'C-u'])
-          await editCard('✋ 已取消方案。直接发一条消息就能让我重新规划。')
+          if (unified) {
+            // Cancel on the run card: mark interrupted so the card finalizes grey
+            // "已中断" (honest — the user cancelled, it did NOT complete; finalize
+            // renders the terminal state and ignores the stale planMd). The note
+            // already tells the user they can just send a new message to re-plan.
+            interruptedChats.add(chatId)
+          } else {
+            await editCard('✋ 已取消方案。直接发一条消息就能让我重新规划。')
+          }
         }
       })()
       return undefined
@@ -2207,6 +2678,31 @@ async function handleCardAction(event: any): Promise<undefined> {
       }
       void relaunchInMode(chatId, mode) // fire-and-forget so we ack the click first
     }
+
+    if (value.t === 'stop') {
+      if (!tmuxReachable()) return undefined
+      // The ⏹ button on the run card: repaint the card to grey "已中断" IMMEDIATELY
+      // on click (don't wait for the next poll — a delayed/missed poll repaint read
+      // as "the card didn't change"), then press the interrupt key to actually stop
+      // the turn. finalizeRunCard logs its PATCH outcome so a silent Feishu failure
+      // is visible rather than looking like a no-op.
+      void (async () => {
+        interruptedChats.add(chatId)
+        const hadCard = runCards.has(chatId)
+        if (hadCard) await finalizeRunCard(chatId, 'interrupted')
+        const wasBusy = tuiBusy()
+        spawnSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Escape'])
+        await delay(900)
+        if (tuiBusy()) spawnSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Escape'])
+        spawnSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'C-u'])
+        connLog(`stop button: wasBusy=${wasBusy}`)
+        if (!hadCard) {
+          interruptedChats.delete(chatId)
+          await notifyChat(chatId, wasBusy ? '⏹ 已中断。' : 'ℹ️ 当前没有正在运行的回合。')
+        }
+      })()
+      return undefined
+    }
   } catch (err) {
     process.stderr.write(`lark channel: card action failed: ${err}\n`)
   }
@@ -2262,17 +2758,35 @@ async function handleInbound(event: any): Promise<void> {
   const trimmed = text.trim()
   const askedAt = awaitingMode.get(chatId)
   if (askedAt && Date.now() - askedAt < 120_000 && normalizeMode(trimmed)) {
+    clearPendingBatch(chatId) // starts a fresh session; drop any buffered message (lost in the relaunch)
     await startNewSession(chatId, trimmed)
     return
   }
   if (askedAt) awaitingMode.delete(chatId) // expired or non-mode reply: drop the flag
   const newMatch = trimmed.match(/^\/new\b\s*(.*)$/)
   if (newMatch) {
+    clearPendingBatch(chatId) // /new starts fresh; drop any buffered message
     await startNewSession(chatId, newMatch[1] || undefined)
+    return
+  }
+  // /mode <plan|bypass|default|acceptEdits>: switch permission mode but KEEP the
+  // conversation (relaunch with --resume), unlike /new which starts fresh. It is NOT a
+  // real TUI command (mode is Shift+Tab / launch-flag only), so without this handler it
+  // fell through to passthrough and silently no-op'd — the gap a /mode plan send hit.
+  const modeMatch = trimmed.match(/^\/mode\b\s*(.*)$/i)
+  if (modeMatch) {
+    clearPendingBatch(chatId) // /mode relaunches (--resume); drop any buffered message (lost in the relaunch)
+    await switchMode(chatId, modeMatch[1])
     return
   }
   const ctrl = parseControlCommand(text)
   if (ctrl) {
+    // /stop means "don't run what I just sent" — DROP the buffer rather than flush it.
+    // Flushing then immediately checking busy-state races: the just-started turn hasn't
+    // rendered "esc to interrupt" yet, so /stop would see idle and fail to stop it.
+    // Other passthrough commands (/model, /compact, …) let a buffered message run first.
+    if (/^\/stop\b/i.test(ctrl.keystrokes)) clearPendingBatch(chatId)
+    else flushForward(chatId)
     await runControlCommand(chatId, ctrl)
     return
   }
@@ -2287,11 +2801,13 @@ async function handleInbound(event: any): Promise<void> {
     // 80-col wrap can't hide it) or option 1's "use auto mode" label — two
     // independent signatures so a label change in either doesn't strand a revise.
     if (paneFlat().includes('Would you like to proceed') || pane.includes('use auto mode')) {
+      flushForward(chatId) // forward any buffered normal message before this command acts
       await reviseViaPlanDialog(chatId, trimmed)
       return
     }
     const ft = freeTextOption(pane)
     if (ft && (parseAskqDialog(pane) || parseGenericDialog(pane))) {
+      flushForward(chatId) // forward any buffered normal message before this command acts
       await answerDialogWithText(chatId, trimmed, ft.num, ft.label)
       return
     }
@@ -2304,24 +2820,14 @@ async function handleInbound(event: any): Promise<void> {
     }).catch(() => {})
   }
 
-  // Thinking indicator: post a placeholder immediately so the sender sees Claude
-  // is working. The reply tool edits this same message into the final answer.
-  if (chatId) {
-    try {
-      const tdata = await larkApi('POST', '/im/v1/messages?receive_id_type=chat_id', {
-        receive_id: chatId,
-        msg_type: 'text',
-        content: JSON.stringify({ text: '⏳ 正在思考…' }),
-      })
-      const tid = tdata.data?.message_id
-      if (tid) {
-        pendingThinking.set(chatId, tid)
-        if (messageId) {
-          try { startLiveProgress(chatId, tid, messageId) } catch {}
-        }
-      }
-    } catch (err) {
-      process.stderr.write(`lark channel: thinking placeholder failed: ${err}\n`)
+  // Live run card: post a persistent activity card and start tailing the
+  // transcript. Unlike the old placeholder, this is NOT the message the reply
+  // tool overwrites — it lives until the turn truly ends, so intermediate replies
+  // ("doc coming") no longer go dark and the mid-turn activity (tools, skill
+  // loads, the latest finding) stays visible.
+  if (chatId && messageId) {
+    try { await startRunCard(chatId, messageId) } catch (err) {
+      process.stderr.write(`lark channel: run card start failed: ${err}\n`)
     }
   }
 
@@ -2355,12 +2861,25 @@ async function handleInbound(event: any): Promise<void> {
   } else if (msgType === 'file') {
     meta.has_attachment = 'true'
     meta.attachment_type = 'file'
+    // Auto-download the file so the session gets a real path, not just a flag — a
+    // "看这几个 ppt" send arrives as a usable file, not a message-id Claude must
+    // fetch by hand. downloadFile enforces MAX_ATTACHMENT_BYTES, so oversized files
+    // are rejected rather than blindly pulled.
+    try {
+      const c = JSON.parse(contentStr)
+      if (c?.file_key) meta.file_path = await downloadFile(messageId, c.file_key, 'file', c.file_name)
+    } catch (err) {
+      process.stderr.write(`lark channel: file download failed: ${err}\n`)
+    }
   } else if (msgType === 'audio') {
-    // Voice message — download it so the session can transcribe it.
+    // Voice message — download it, then transcribe it HERE (the bridge owns the
+    // transcription) so the model gets text, not a "go find a transcriber" hint.
     try {
       const fileKey = JSON.parse(contentStr)?.file_key
       if (fileKey) {
         meta.audio_path = await downloadFile(messageId, fileKey, 'file', 'voice.opus')
+        const transcript = transcribeAudio(meta.audio_path)
+        if (transcript) meta.transcript = transcript
       }
     } catch (err) {
       process.stderr.write(`lark channel: audio download failed: ${err}\n`)
@@ -2394,12 +2913,79 @@ async function handleInbound(event: any): Promise<void> {
     }
   }
 
-  const content = text || (meta.image_path ? '(image)' : meta.audio_path ? '(voice message)' : '(attachment)')
+  const content = text || (meta.transcript ? `[语音转写] ${meta.transcript}` : meta.image_path ? '(image)' : meta.audio_path ? '(voice message)' : '(attachment)')
 
-  void mcp.notification({
-    method: 'notifications/claude/channel',
-    params: { content, meta },
+  enqueueForward(chatId, content, meta)
+}
+
+// Per-chat outbound debounce: buffer a normal message briefly, so a text + its
+// rapid follow-up files coalesce into ONE turn instead of racing the idle start.
+// Single message in the window → forwarded byte-identically (no behavior change).
+function enqueueForward(chatId: string, content: string, meta: Record<string, string>): void {
+  const b = pendingBatches.get(chatId)
+  if (b) {
+    clearTimeout(b.timer)
+    b.contents.push(content)
+    b.metas.push(meta)
+    b.timer = setTimeout(() => flushForward(chatId), MERGE_QUIET_MS)
+    return
+  }
+  pendingBatches.set(chatId, {
+    contents: [content], metas: [meta],
+    timer: setTimeout(() => flushForward(chatId), MERGE_QUIET_MS),
   })
+}
+
+function flushForward(chatId: string): void {
+  const b = pendingBatches.get(chatId)
+  if (!b) return
+  pendingBatches.delete(chatId)
+  try {
+    if (b.contents.length === 1) {
+      // Single message: byte-identical to the old direct-forward behavior.
+      void mcp.notification({ method: 'notifications/claude/channel', params: { content: b.contents[0], meta: b.metas[0] } })
+      return
+    }
+    // Merged batch: keep the real user text, PROMOTE the first attachment of each type
+    // to a channel attribute (so the model gets the same auto-Read/auto-render contract
+    // a single message would), and ALSO inline every attachment path with an explicit
+    // Read instruction so none is overlooked — the harness renders only ONE file_path/
+    // image_path/audio_path attribute, but a burst can carry several. Keep the FIRST
+    // message's identity fields for reply threading + access checks.
+    const PLACEHOLDERS = new Set(['(attachment)', '(image)', '(voice message)'])
+    const texts = b.contents.filter((c) => !PLACEHOLDERS.has(c))
+    const base = b.metas[0]
+    const mergedMeta: Record<string, string> = {
+      chat_id: base.chat_id, message_id: base.message_id,
+      user: base.user, user_id: base.user_id, ts: base.ts,
+    }
+    if (base.thread_root_id) mergedMeta.thread_root_id = base.thread_root_id
+    const paths: string[] = []
+    for (const m of b.metas) {
+      const p = m.file_path || m.image_path || m.audio_path
+      if (!p) continue
+      paths.push(p)
+      if (m.image_path && !mergedMeta.image_path) mergedMeta.image_path = m.image_path
+      else if (m.file_path && !mergedMeta.file_path) mergedMeta.file_path = m.file_path
+      else if (m.audio_path && !mergedMeta.audio_path) mergedMeta.audio_path = m.audio_path
+    }
+    const mergedContent = [
+      texts.join('\n\n'),
+      paths.length ? `（本条共 ${paths.length} 个附件，请用 Read 工具逐个打开）：\n` + paths.map((p) => `• ${p}`).join('\n') : '',
+    ].filter(Boolean).join('\n\n') || '(attachment)'
+    void mcp.notification({ method: 'notifications/claude/channel', params: { content: mergedContent, meta: mergedMeta } })
+  } catch (err) {
+    process.stderr.write(`lark channel: flushForward failed: ${err}\n`)
+  }
+}
+
+// Drop a pending buffered batch WITHOUT forwarding it. Used when a command supersedes
+// the buffer: a relaunch (/new, /mode) where the message would be lost in the relaunch
+// anyway, or /stop where "send X then stop" means "don't run X" (and flushing would race
+// the busy-state check, letting the turn start unstoppably).
+function clearPendingBatch(chatId: string): void {
+  const b = pendingBatches.get(chatId)
+  if (b) { clearTimeout(b.timer); pendingBatches.delete(chatId) }
 }
 
 // ─── Lock file for exclusive WSClient connection ────────────────────────────
@@ -2516,6 +3102,7 @@ const eventDispatcher = new Lark.EventDispatcher({}).register({
 
 let wsClient: InstanceType<typeof Lark.WSClient> | null = null
 let lockCheckInterval: ReturnType<typeof setInterval> | null = null
+let wakeWatchInterval: ReturnType<typeof setInterval> | null = null
 
 function startWsClient(): void {
   if (wsClient) return
@@ -2524,22 +3111,71 @@ function startWsClient(): void {
     appSecret: APP_SECRET!,
     domain: larkDomain,
     loggerLevel: Lark.LoggerLevel.info,
-  })
+    // Re-enable the SDK's dead-socket watchdog: if no pong/inbound arrives within
+    // 10s of a ping, the socket is presumed dead and terminated to force a reconnect.
+    // The default (0) is a no-op — which left a ~120s blind window after a laptop/
+    // phone wake (the worst case for phone use, where a stale socket silently eats
+    // messages). Full sleep/wake drift-detection + app-level force-reconnect is a
+    // later increment; this is the cheap, load-bearing half.
+    wsConfig: { pingTimeout: 10 },
+    // The SDK auto-reconnects (autoReconnect defaults true) but did so invisibly —
+    // wire the callbacks so a drop/recovery at least shows in the log.
+    onReconnecting: () => connLog('ws reconnecting…'),
+    onReconnected: () => connLog('ws reconnected'),
+  } as any)
   wsClient.start({ eventDispatcher })
-  connLog(`connected` + (botName ? ` (bot: ${botName})` : '') + ' [v0.9.2]')
+  // Tie sleep/wake drift detection to socket ownership (idempotent via its own guard),
+  // so the /lark:takeover and lock-reacquire owners get it too — not just cold start.
+  startWakeWatcher()
+  connLog(`connected` + (botName ? ` (bot: ${botName})` : '') + ' [v0.13.0]')
 }
 
 function stopWsClient(): void {
   if (!wsClient) return
   wsClient.close({ force: true })
   wsClient = null
+  // The wake watcher exists iff this session owns the socket — stop it on disconnect.
+  // startWsClient re-arms it on reacquire (forceReconnect re-checks ownership regardless,
+  // so this is hygiene rather than safety).
+  if (wakeWatchInterval) { clearInterval(wakeWatchInterval); wakeWatchInterval = null }
   connLog('disconnected (lock lost)')
+}
+
+function forceReconnect(reason: string): void {
+  // Only the lock owner ever touches the socket. Re-check ownership: a takeover
+  // during sleep means we no longer own it — bail (the new owner has the socket).
+  const lock = readLock()
+  if (!wsClient || lock?.pid !== process.pid) return
+  connLog(`ws force-reconnect (${reason})`)
+  // close({force:true}) terminates the old socket + clears its timers; start() →
+  // reConnect(true) terminates any leftover instance before connecting. We hold the
+  // lock across both, synchronously, so no second socket can open in the gap.
+  wsClient.close({ force: true })
+  wsClient = null
+  startWsClient()
+}
+
+const WAKE_TICK_MS = 5000
+const WAKE_DRIFT_MS = 15000   // an event-loop gap >> tick means the machine slept
+function startWakeWatcher(): void {
+  if (wakeWatchInterval) return
+  let last = Date.now()
+  wakeWatchInterval = setInterval(() => {
+    const now = Date.now()
+    const gap = now - last
+    last = now
+    if (gap > WAKE_DRIFT_MS) {
+      // The event loop was frozen ~gap ms — almost certainly sleep/suspend. The OS
+      // socket is likely dead but the SDK won't notice until its next ping + 10s.
+      forceReconnect(`wake/drift gap=${Math.round(gap / 1000)}s`)
+    }
+  }, WAKE_TICK_MS)
 }
 
 if (!IS_BRIDGE) {
   connLog('dormant (LARK_BRIDGE unset — this session will not hold the Feishu connection)')
 } else if (acquireLock()) {
-  startWsClient()
+  startWsClient() // also starts the wake watcher (now tied to socket ownership)
   startDialogWatcher()
 } else {
   const lock = readLock()
@@ -2596,6 +3232,11 @@ lockCheckInterval = setInterval(() => {
 // Graceful shutdown
 const shutdown = () => {
   if (lockCheckInterval) clearInterval(lockCheckInterval)
+  if (wakeWatchInterval) clearInterval(wakeWatchInterval)
+  // Best-effort: forward any message still buffered in the merge window so a clean
+  // shutdown doesn't silently drop it (bounded by the ≤600ms window; a hard kill can
+  // still lose it — inherent to in-memory buffering).
+  for (const chatId of [...pendingBatches.keys()]) { try { flushForward(chatId) } catch {} }
   unregisterSession()
   const lock = readLock()
   if (lock?.pid === process.pid) removeLock()

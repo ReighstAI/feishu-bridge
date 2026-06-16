@@ -37,7 +37,7 @@ ask(){ # ask VAR "prompt" "default"  — in --auto, takes default/env without pr
 }
 
 # ── 0. prerequisites ─────────────────────────────────────────────────────────
-say "0/7  检查前置依赖"
+say "0/8  检查前置依赖"
 command -v claude >/dev/null || die "未安装 Claude Code，或不在 PATH。先安装并登录后重试。"
 ok "claude $(claude --version 2>/dev/null | head -1)"
 if ! command -v bun >/dev/null; then
@@ -52,7 +52,7 @@ fi
 command -v tmux >/dev/null && ok "tmux $(tmux -V)" || die "tmux 安装失败，手动跑 brew install tmux 后重试。"
 
 # ── 1. Feishu credentials (reuse old bridge .env if present) ─────────────────
-say "1/7  配置飞书凭据"
+say "1/8  配置飞书凭据"
 mkdir -p "$STATE_DIR"
 APP_ID="${LARK_APP_ID:-}"; APP_SECRET="${LARK_APP_SECRET:-}"
 if [ -z "$APP_ID" ] || [ -z "$APP_SECRET" ]; then
@@ -103,7 +103,12 @@ fi
 #  - permissions.allow: pre-allow the bridge's OWN Feishu tools (reply/react/…)
 #    — they only message the owner, zero risk, and must never prompt or the
 #    session freezes when it tries to reply in a non-bypass mode.
-cat > "$STATE_DIR/bridge-settings.json" <<'EOF'
+#  - hooks.PreToolUse: a hard-block guard for catastrophic Bash commands (recursive
+#    rm on home/.claude/workdir, DROP TABLE, dropdb, HTTP DELETE, …). bypassPermissions
+#    skips the permission PROMPT but NOT PreToolUse hooks, so this stays a safety net
+#    even hands-free. The heredoc is unquoted ONLY so $SCRIPTS_DIR bakes into an
+#    absolute path; no other $ appears in the JSON.
+cat > "$STATE_DIR/bridge-settings.json" <<EOF
 {
   "enableAllProjectMcpServers": true,
   "skipDangerousModePermissionPrompt": true,
@@ -115,13 +120,23 @@ cat > "$STATE_DIR/bridge-settings.json" <<'EOF'
       "mcp__plugin_lark_lark__fetch_messages",
       "mcp__plugin_lark_lark__download_attachment"
     ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "python3 '$SCRIPTS_DIR/hooks/destructive-op-guard.py'" }
+        ]
+      }
+    ]
   }
 }
 EOF
 ok "bridge-settings.json：自动批准项目 MCP + 跳过 bypass 警告 + 预授权飞书回复工具（非 bypass 不卡）"
 
 # ── 2. working dir + bridge.conf ─────────────────────────────────────────────
-say "2/7  工作目录与默认模式"
+say "2/8  工作目录与默认模式"
 # Re-running to upgrade? Reuse the saved choices as defaults so an upgrade never
 # silently resets workdir/mode. Without this, the README's bare `./install.sh
 # --auto` upgrade falls back to the built-in acceptEdits and flips a
@@ -174,20 +189,84 @@ else
 fi
 
 # ── 3. install scripts ───────────────────────────────────────────────────────
-say "3/7  安装脚本"
+say "3/8  安装脚本"
 mkdir -p "$SCRIPTS_DIR/bin"
 cp "$BUNDLE/bin/bridge-supervisor.sh" "$BUNDLE/bin/bridge-launchd.sh" "$BUNDLE/bin/stop-old-bridge.sh" "$BUNDLE/verify.sh" "$SCRIPTS_DIR/bin/"
 chmod +x "$SCRIPTS_DIR/bin/"*.sh
 ok "→ $SCRIPTS_DIR/bin/"
+# Destructive-op guard for the PreToolUse hook above — a stable path the baked-in
+# bridge-settings.json points at (the plugin install dir isn't a stable reference).
+mkdir -p "$SCRIPTS_DIR/hooks"
+cp "$BUNDLE/plugin/hooks/destructive-op-guard.py" "$SCRIPTS_DIR/hooks/"
+ok "→ $SCRIPTS_DIR/hooks/destructive-op-guard.py（破坏性操作防护闸）"
 
-# ── 4. install the lark plugin (local scope, in the workdir) ─────────────────
-say "4/7  安装 lark 插件"
+# ── 4. voice transcription (best-effort — never fails the core install) ──────
+say "4/8  语音转写（尽力而为，失败不影响装桥）"
+# The bridge transcribes incoming voice messages by shelling out to
+# ~/.local/bin/whisper-transcribe (server.ts: LARK_WHISPER_BIN, defaults to that
+# path). If the binary is absent the bridge just hands the model the raw audio
+# path and keeps working — so every step below is guarded: any failure warns and
+# continues, and the wrapper itself degrades gracefully when its deps are missing.
+WHISPER_MODEL_DIR="$HOME/.local/share/whisper-cpp"
+WHISPER_MODEL="$WHISPER_MODEL_DIR/ggml-base.bin"
+WHISPER_MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin"
+WHISPER_BIN="$HOME/.local/bin/whisper-transcribe"
+if ! command -v brew >/dev/null 2>&1; then
+  warn "未装 Homebrew，跳过语音转写（语音消息仍可收，只是不自动转文字）。"
+else
+  # whisper-cli (transcriber) comes from the whisper-cpp formula; ffmpeg converts
+  # the opus voice clip to the 16kHz mono WAV whisper wants. brew install is
+  # idempotent (re-running just relinks). Failure → warn, keep going.
+  if command -v whisper-cli >/dev/null 2>&1 && command -v ffmpeg >/dev/null 2>&1; then
+    ok "whisper-cli + ffmpeg 已就位"
+  else
+    warn "正在安装 whisper-cpp + ffmpeg…（首次可能要几分钟）"
+    brew install whisper-cpp ffmpeg >/dev/null 2>&1 || warn "brew 装 whisper-cpp/ffmpeg 失败，跳过语音转写（语音消息仍可收）。"
+  fi
+  # Download the model only if absent — keeps re-runs idempotent and offline-safe.
+  # curl -fL: -f fails (non-zero, no body) on an HTTP error so a 404/500 can't
+  # write a corrupt file; -L follows HuggingFace's CDN redirect. Download to a
+  # temp file and move into place only on success, so an interrupted download
+  # never leaves a half-written model the wrapper would choke on.
+  if command -v whisper-cli >/dev/null 2>&1; then
+    if [ -f "$WHISPER_MODEL" ]; then
+      ok "语音模型已存在，保留（$WHISPER_MODEL）"
+    else
+      mkdir -p "$WHISPER_MODEL_DIR"
+      warn "正在下载语音模型 ggml-base.bin（约 142MB）…"
+      WHISPER_MODEL_TMP="$WHISPER_MODEL.download.$$"
+      if curl -fL --retry 2 -o "$WHISPER_MODEL_TMP" "$WHISPER_MODEL_URL" 2>/dev/null; then
+        mv "$WHISPER_MODEL_TMP" "$WHISPER_MODEL" && ok "语音模型已下载"
+      else
+        rm -f "$WHISPER_MODEL_TMP"
+        warn "语音模型下载失败（网络问题？），跳过语音转写（语音消息仍可收）。稍后重跑安装器会自动补下。"
+      fi
+    fi
+  fi
+  # Install the wrapper regardless of whether the model/brew steps succeeded — it
+  # self-checks its deps at runtime and degrades gracefully, so a later `brew
+  # install` or model download makes voice "just work" without re-running this.
+  mkdir -p "$HOME/.local/bin"
+  if cp "$BUNDLE/bin/whisper-transcribe.sh" "$WHISPER_BIN" 2>/dev/null; then
+    chmod +x "$WHISPER_BIN"
+    if [ -f "$WHISPER_MODEL" ] && command -v whisper-cli >/dev/null 2>&1 && command -v ffmpeg >/dev/null 2>&1; then
+      ok "语音转写已就绪"
+    else
+      ok "语音转写脚本已装（→ $WHISPER_BIN）；缺组件会自动跳过，补齐后即可转写"
+    fi
+  else
+    warn "安装语音转写脚本失败，跳过（语音消息仍可收）。"
+  fi
+fi
+
+# ── 5. install the lark plugin (local scope, in the workdir) ─────────────────
+say "5/8  安装 lark 插件"
 claude plugin marketplace add "$BUNDLE/plugin" >/dev/null 2>&1 || warn "marketplace add 可能已存在"
 ( cd "$BRIDGE_WORKDIR" && claude plugin install -s local lark@claude-code-lark ) >/dev/null 2>&1 \
   && ok "插件已装（local 作用域，仅此工作目录启用）" || warn "插件安装返回非零，稍后用 /plugin 检查"
 
-# ── 5. managed-settings allowlist (needs sudo, merge-safe) ───────────────────
-say "5/7  频道白名单（需要一次管理员密码）"
+# ── 6. managed-settings allowlist (needs sudo, merge-safe) ───────────────────
+say "6/8  频道白名单（需要一次管理员密码）"
 MS_STAGE="$SCRIPTS_DIR/managed-settings.json"
 # Build the channel allowlist with bun (guaranteed present from step 0). A fresh
 # Mac may have no python3, and a silent python3 failure here would have written an
@@ -220,8 +299,8 @@ else
   echo "    （这个文件在固定位置、不会被系统清理，随时可跑。）"
 fi
 
-# ── 6. launchd autostart ─────────────────────────────────────────────────────
-say "6/7  开机自启 (launchd)"
+# ── 7. launchd autostart ─────────────────────────────────────────────────────
+say "7/8  开机自启 (launchd)"
 mkdir -p "$(dirname "$PLIST")"
 TOOLPATH="$(dirname "$(command -v bun)"):$(dirname "$(command -v claude)"):$(dirname "$(command -v tmux)")"
 sed -e "s#__HOME__#$HOME#g" -e "s#__SCRIPTS__#$SCRIPTS_DIR/bin#g" -e "s#__WORKDIR__#$BRIDGE_WORKDIR#g" -e "s#__TOOLPATH__#$TOOLPATH#g" \
@@ -241,8 +320,8 @@ else
   echo "      launchctl bootstrap gui/\$(id -u) \"$PLIST\""
 fi
 
-# ── 7. verify ────────────────────────────────────────────────────────────────
-say "7/7  验证"
+# ── 8. verify ────────────────────────────────────────────────────────────────
+say "8/8  验证"
 if [ "$SUDO_OK" = 1 ]; then
   bash "$SCRIPTS_DIR/bin/verify.sh" || warn "验证未全通过，按上面提示排查。"
 else

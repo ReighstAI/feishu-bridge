@@ -23,6 +23,7 @@ launchd → bridge-launchd.sh → tmux「bridge」→ bridge-supervisor.sh
 - Claude Code 已安装并登录（用自己的订阅）
 - `bun`、`tmux`（安装器没有会自动装；tmux 走 Homebrew）
 - 自己的飞书机器人（App ID + Secret）。已经在用旧版 Python 桥的话，安装器会**自动复用**它的 `.env`，不用再填。
+- **语音转写（可选）**：装有 Homebrew 时，安装器会顺手装 `whisper-cpp` + `ffmpeg` 并下个语音模型（约 142MB），这样发语音消息会自动转成文字。没装 Homebrew 或下载失败都不影响装桥——语音消息照样能收，只是不自动转文字。
 
 ## 安装方式一：在终端跑（推荐给能开终端的人）
 
