@@ -4,6 +4,19 @@ All notable changes to the Feishu ↔ Claude Code bridge. Versions follow
 semantic versioning. The running bridge stamps its version in the connection
 log: `connected (bot: …) [vX.Y.Z]`.
 
+## 0.14.0 — 2026-06-21
+
+- **Long-lived auth token (no more silent OAuth lockouts).** The bridge ran on the
+  interactive keychain OAuth, whose access/refresh tokens periodically expire and
+  can fail to auto-refresh — after which every message silently gets `Please run
+  /login · API Error: 401` until someone re-logs in at the terminal. For an
+  unattended, often-remote bridge that's a hard outage with no signal to the phone.
+  The supervisor now uses a long-lived token when one is present at
+  `~/.claude/channels/lark/oauth-token`: generate it once with `claude setup-token`
+  (subscription-billed, valid ~1 year), save it there, and restart. Missing file →
+  falls back to keychain auth, so existing installs are unaffected. Setup steps are
+  in the README (排查 + the install prompt).
+
 ## 0.13.0 — 2026-06-17
 
 Batch B: three turn-delivery and connection-resilience fixes.

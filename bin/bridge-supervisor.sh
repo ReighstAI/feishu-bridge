@@ -26,6 +26,17 @@ rm -f "$STOP"
 export LARK_TMUX_SESSION="$SESSION"   # so the lark server's send-keys hits this session
 export LARK_BRIDGE=1                  # only this claude may hold the Feishu WS; other sessions stay dormant
 export BRIDGE_WORKDIR="$WORKDIR"      # the PreToolUse destructive-op guard reads this to protect the workdir
+
+# Long-lived auth (optional, recommended for an unattended bridge): if the owner
+# ran `claude setup-token` and saved the token to $TOKEN_FILE, use it. This frees
+# the bridge from the interactive keychain OAuth, whose access/refresh tokens
+# periodically expire and then silently lock the bridge out — every message gets
+# "Please run /login · 401" until someone re-logs in at the terminal. The
+# setup-token token is subscription-billed and valid ~1 year. Missing file → falls
+# back to keychain auth, so existing installs are unaffected.
+TOKEN_FILE="$STATE_DIR/oauth-token"
+[ -s "$TOKEN_FILE" ] && export CLAUDE_CODE_OAUTH_TOKEN="$(cat "$TOKEN_FILE")"
+
 cd "$WORKDIR" || { echo "[supervisor] workdir missing: $WORKDIR"; exit 1; }
 
 # --settings loads ADDITIONAL bridge-only settings (enableAllProjectMcpServers)
