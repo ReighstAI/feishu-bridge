@@ -66,13 +66,6 @@ cd feishu-bridge
 6. 成功后告诉我：我用飞书给机器人发一条消息就行——第一条消息会自动授权，
    不需要配对码。
 
-7. （推荐，能用之后再做）帮我设一个长期登录 token，免得以后登录态过期、桥突然
-   全部不回还没提示。跑 `claude setup-token`，把它给的网址显示给我 → 我在浏览器
-   登录、把页面上的 code 发回给你 → 你拿 code 换到 token 后，用 `umask 077` 创建
-   `~/.claude/channels/lark/oauth-token` 把 token 写进去（权限 600，token 绝不要
-   打印出来或写到别处），再 `launchctl kickstart -k gui/$(id -u)/com.feishu-bridge.daemon`
-   重启。这个 token 走订阅计费、约一年有效，桥会自动优先用它。
-
 完成后给我一句话总结（成功/卡在哪一步）。
 ```
 
@@ -99,13 +92,6 @@ cd feishu-bridge
 
 - **发消息没反应（或时有时无）**：先看旧的 Python 桥是不是还在跑——一个机器人只能有一条连接，跑 `bash ~/.feishu-bridge/bin/stop-old-bridge.sh`。再看 `tail ~/.claude/channels/lark/server.log`：有 `failed to fetch bot info` 就是 App ID/Secret 不对，或飞书后台没开「长连接 / 事件订阅」。
 - **装完一直完全没反应（不是时有时无，是从来不回），或重启后突然不回了**：旧版（≤0.9.0）在全新机器上可能卡在两个开机对话框——「是否信任此文件夹」和 bypass 模式警告——它们在频道连上之前就弹、手机端看不到也点不了，桥就一直连不上。0.9.1 起安装器会自动预批准这两个。升级修复：`cd ~/feishu-bridge && git pull && ./install.sh --auto`，再 `launchctl kickstart -k gui/$(id -u)/com.feishu-bridge.daemon` 重启一次验证。
-- **本来好好的，突然全部不回了，日志（`tail ~/.claude/channels/lark/server.log` 或终端里的桥会话）出现 `Please run /login · API Error: 401`**：keychain 里的登录态（OAuth token）到期了、自动续期没成，得重新登录一次（终端 `claude` → `/login`）。想一劳永逸、不再被这个打断，换成长期 token：
-  ```bash
-  claude setup-token                    # 浏览器登录，复制它打印的 token
-  umask 077
-  printf '%s' '把token粘到这里' > ~/.claude/channels/lark/oauth-token
-  launchctl kickstart -k gui/$(id -u)/com.feishu-bridge.daemon   # 重启，桥即改用它
-  ```
-  这个 token 走订阅计费、约一年有效，桥会自动优先用它，过期掉线基本消失。
+- **本来好好的，突然全部不回了，日志（`tail ~/.claude/channels/lark/server.log` 或终端里的桥会话）出现 `Please run /login · API Error: 401`**：交互式会话的 keychain 登录态过期了，到运行桥的终端（或 tmux 的 `bridge` 会话里）跑 `claude` → `/login` 重新授权即可。两点注意：① `CLAUDE_CODE_OAUTH_TOKEN`（`claude setup-token` 出的长期 token）**只对 `claude -p` 无界面模式有效，交互式的桥不认它**，别指望用它免登录；② 确认只有一个 `claude --channels` 进程在跑（`pgrep -f 'channels plugin:lark'` 应只返回一个）——多个进程会互相挤掉登录、加速过期。
 - **每次重启弹「开发频道」警告框**：频道白名单（managed-settings.json）没写成。重跑安装器第 5 步的 sudo 命令。
 - **`/model` 之类打开了选择器没反应**：少数命令会开交互选择器，send-keys 进得去但选不动——这类需要在终端里操作，属于已知边界。

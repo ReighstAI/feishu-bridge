@@ -6,16 +6,17 @@ log: `connected (bot: …) [vX.Y.Z]`.
 
 ## 0.14.0 — 2026-06-21
 
-- **Long-lived auth token (no more silent OAuth lockouts).** The bridge ran on the
-  interactive keychain OAuth, whose access/refresh tokens periodically expire and
-  can fail to auto-refresh — after which every message silently gets `Please run
-  /login · API Error: 401` until someone re-logs in at the terminal. For an
-  unattended, often-remote bridge that's a hard outage with no signal to the phone.
-  The supervisor now uses a long-lived token when one is present at
-  `~/.claude/channels/lark/oauth-token`: generate it once with `claude setup-token`
-  (subscription-billed, valid ~1 year), save it there, and restart. Missing file →
-  falls back to keychain auth, so existing installs are unaffected. Setup steps are
-  in the README (排查 + the install prompt).
+- **Reverted: long-lived auth token.** An earlier same-day 0.14.0 added optional
+  `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) support to dodge the
+  keychain-OAuth `Please run /login · 401` lockouts. It was **reverted the same
+  day**: interactive Claude Code — which is what the bridge runs — does **not**
+  honor `CLAUDE_CODE_OAUTH_TOKEN`; only `claude -p` / headless does. With the env
+  var set, the interactive session even shows "Claude API" in its banner but still
+  401s. So the token never actually authenticated the bridge. The bridge stays on
+  keychain login; recover a 401 by running `/login` in the bridge session. The
+  mitigation that does help: make sure only ONE `claude --channels` process runs
+  (`pgrep -f 'channels plugin:lark'`) — multiple processes invalidate each other's
+  login and accelerate expiry.
 
 ## 0.13.0 — 2026-06-17
 
