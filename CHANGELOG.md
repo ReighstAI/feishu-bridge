@@ -4,6 +4,24 @@ All notable changes to the Feishu ↔ Claude Code bridge. Versions follow
 semantic versioning. The running bridge stamps its version in the connection
 log: `connected (bot: …) [vX.Y.Z]`.
 
+## 0.14.1 — 2026-06-22
+
+- **Durable unattended auth — the working version** (supersedes 0.14.0's reverted
+  attempt). Two changes that together end the `Please run /login · 401` lockouts:
+  - **`ANTHROPIC_AUTH_TOKEN`, not `CLAUDE_CODE_OAUTH_TOKEN`.** Interactive Claude
+    Code ignores `CLAUDE_CODE_OAUTH_TOKEN` (0.14.0's mistake — it only works with
+    `claude -p`) but DOES honor `ANTHROPIC_AUTH_TOKEN` (auth precedence #2, terminal
+    sessions) — verified in interactive mode. Point it at the long-lived `claude
+    setup-token` token (`sk-ant-oat01-…`, subscription-billed, ~1 year) saved at
+    `~/.claude/channels/lark/oauth-token`; the supervisor exports it automatically
+    when present, else falls back to keychain `/login`.
+  - **Single-instance guard.** `tmux kill-session` (the usual restart) does not kill
+    the claude inside — it orphans it. The orphan keeps the Feishu WS and keeps
+    refreshing the shared keychain login, so multiple claudes rotate the OAuth
+    refresh token and 401 each other — the real cause of the rapid recurring
+    lockouts. The supervisor now `pkill`s any stray channel claude before launching,
+    so only one ever runs.
+
 ## 0.14.0 — 2026-06-21
 
 - **Reverted: long-lived auth token.** An earlier same-day 0.14.0 added optional

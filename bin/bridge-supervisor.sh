@@ -28,10 +28,28 @@ export LARK_BRIDGE=1                  # only this claude may hold the Feishu WS;
 export BRIDGE_WORKDIR="$WORKDIR"      # the PreToolUse destructive-op guard reads this to protect the workdir
 cd "$WORKDIR" || { echo "[supervisor] workdir missing: $WORKDIR"; exit 1; }
 
+# Durable auth for an unattended INTERACTIVE bridge. Interactive Claude Code ignores
+# CLAUDE_CODE_OAUTH_TOKEN (only `claude -p` honors it) and falls through to keychain
+# /login, which expires and 401s the bridge with no human to re-login. ANTHROPIC_AUTH_TOKEN
+# (auth precedence #2, terminal sessions) IS honored interactively — point it at the
+# long-lived `claude setup-token` token (sk-ant-oat01-…, subscription-billed, ~1yr).
+# Missing file → falls back to keychain /login. Rotate yearly: re-run setup-token,
+# overwrite the file, restart.
+TOKEN_FILE="$STATE_DIR/oauth-token"
+[ -s "$TOKEN_FILE" ] && export ANTHROPIC_AUTH_TOKEN="$(cat "$TOKEN_FILE")"
+
 # --settings loads ADDITIONAL bridge-only settings (enableAllProjectMcpServers)
 # so non-bypass launches don't hang at the project-MCP discovery prompt, which
 # fires before the channel server is up and so can't be surfaced to Feishu.
 COMMON=(--settings "$STATE_DIR/bridge-settings.json" --channels "plugin:$PLUGIN")
+
+# Single-instance guard. `tmux kill-session` does NOT kill the claude inside — it
+# orphans it: the old claude keeps the Feishu WS and keeps refreshing the shared
+# keychain login, so multiple claudes rotate the refresh token and 401 each other.
+# Kill any stray bridge claude before launching ours. Safe: launchd guarantees one
+# supervisor, so an existing channel claude here is an orphan, never a peer we need.
+pkill -9 -f "channels plugin:$PLUGIN" 2>/dev/null || true
+
 echo "[supervisor] up (workdir=$WORKDIR, plugin=$PLUGIN)"
 while true; do
   MODE="$(cat "$MODE_FILE" 2>/dev/null || echo "$DEFAULT_MODE")"
