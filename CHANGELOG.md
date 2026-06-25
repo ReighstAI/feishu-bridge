@@ -4,6 +4,20 @@ All notable changes to the Feishu ↔ Claude Code bridge. Versions follow
 semantic versioning. The running bridge stamps its version in the connection
 log: `connected (bot: …) [vX.Y.Z]`.
 
+## 0.15.0 — 2026-06-25
+
+- **`/effort` switches reasoning effort mid-session.** Claude Code 2.1.x added a
+  real `/effort <low|medium|high|xhigh|max>` TUI command, so the bridge no longer
+  intercepts and blocks it — `/effort` is now forwarded into the real TUI like
+  `/model`, switching effort for the current session.
+- **Dialog-title parsing fix.** Indented / box-bordered TUI prompts were stripped
+  to blank, so a numbered-choice dialog fell back to a generic placeholder card.
+  The title text now survives, so the card shows the real question.
+- **Group slash-commands.** A group message arrives prefixed with the bot
+  @mention, which used to stop `/model`, `/compact`, … from being recognized. The
+  leading @bot mention is now stripped so slash-commands parse exactly as they do
+  in DMs.
+
 ## 0.14.1 — 2026-06-22
 
 - **Durable unattended auth — the working version** (supersedes 0.14.0's reverted

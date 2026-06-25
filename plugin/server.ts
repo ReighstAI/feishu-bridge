@@ -1633,6 +1633,12 @@ function parseGenericDialog(pane: string): GenericDialog | null {
   // Plain numbered lists in normal output don't carry this cursor.
   if (!lines.some(l => /^\s*❯\s*\d+\.\s/.test(l))) return null
   const cut = (s: string) => s.split(/\s{2,}|[┌│├└╭╮╰╯─]/)[0].trim()
+  // Title/body lines are indented (and sometimes box-bordered). cut() splits on
+  // the leading indent and keeps the empty first chunk, so every title line came
+  // back blank and the card fell to the generic placeholder. clean() only strips
+  // the edge whitespace/border and keeps the text, so the real prompt survives.
+  const clean = (s: string) =>
+    s.replace(/^[\s│┃┆┊╎╏┌├└╭╰]+/, '').replace(/[\s│┃┆┊╎╏┐┤┘╮╯─]+$/, '').trim()
   const raw: { n: string; label: string; line: number }[] = []
   for (let i = 0; i < lines.length; i++) {
     const m = lines[i].match(/^\s*[❯>]?\s*(\d+)\.\s+(.+)/)
@@ -1641,8 +1647,8 @@ function parseGenericDialog(pane: string): GenericDialog | null {
   const options = raw.filter(o => !/^(type something|chat about this)\.?$/i.test(o.label))
   if (options.length < 2) return null
   const firstLine = raw[0].line
-  const prompt = lines.slice(Math.max(0, firstLine - 5), firstLine)
-    .map(cut).filter(l => l && !/^[❯>]?\s*\d+\./.test(l)).slice(-3).join(' ').slice(0, 400)
+  const prompt = lines.slice(Math.max(0, firstLine - 8), firstLine)
+    .map(clean).filter(l => l && !/^[❯>]?\s*\d+\.\s/.test(l)).slice(-6).join('\n').slice(0, 500)
   const sig = (prompt || 'dialog') + '||' + options.map(o => o.n + ':' + o.label).join('|')
   return { prompt, options, sig }
 }
@@ -1978,12 +1984,11 @@ async function runControlCommand(chatId: string, ctrl: { keystrokes: string; lab
       return
     }
 
-    // /effort is a launch flag, not a TUI command — passing it through silently does
-    // nothing while telling the user "已发送". Intercept and say so plainly.
-    if (/^\/effort\b/i.test(ctrl.keystrokes)) {
-      await notifyChat(chatId, 'ℹ️ 这个桥不支持中途切 effort,它固定在启动时的级别。')
-      return
-    }
+    // /effort was once blocked here on the belief it was launch-only. As of Claude
+    // Code 2.1.x the TUI has a real `/effort <low|medium|high|xhigh|max>` command that
+    // switches effort mid-session ("this session only"), so we let it fall through to
+    // the generic forwarder below — same path as /model. The launch --effort flag is
+    // still the persistent default that a fresh session / restart falls back to.
 
     if (!tmuxReachable()) {
       throw new Error(`tmux session "${TMUX_SESSION}" 不可达 — 请用 bridge-supervisor.sh 启动`)
@@ -2754,8 +2759,23 @@ async function handleInbound(event: any): Promise<void> {
 
   const access = result.access
 
+  // In a group every inbound is prefixed with a literal "@<bot>" (requireMention is on),
+  // which stopped slash commands from working: "@<bot> /model" doesn't start with "/", so
+  // parseControlCommand and the /new、/mode checks below all missed it and it got forwarded
+  // as a normal message. Strip a single leading bot-mention so group commands parse exactly
+  // like DM commands. DM messages carry no mention → body === text, behavior unchanged.
+  let body = text
+  {
+    const botMention = (mentions ?? []).find((m) => m.id.open_id === botOpenId)
+    if (botMention) {
+      const tok = '@' + botMention.name
+      const lead = body.trimStart()
+      if (lead.startsWith(tok)) body = lead.slice(tok.length).trimStart()
+    }
+  }
+
   // Control / session commands? Drive the real TUI via tmux instead of forwarding.
-  const trimmed = text.trim()
+  const trimmed = body.trim()
   const askedAt = awaitingMode.get(chatId)
   if (askedAt && Date.now() - askedAt < 120_000 && normalizeMode(trimmed)) {
     clearPendingBatch(chatId) // starts a fresh session; drop any buffered message (lost in the relaunch)
@@ -2779,7 +2799,7 @@ async function handleInbound(event: any): Promise<void> {
     await switchMode(chatId, modeMatch[1])
     return
   }
-  const ctrl = parseControlCommand(text)
+  const ctrl = parseControlCommand(body)
   if (ctrl) {
     // /stop means "don't run what I just sent" — DROP the buffer rather than flush it.
     // Flushing then immediately checking busy-state races: the just-started turn hasn't
