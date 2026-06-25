@@ -4,6 +4,16 @@ All notable changes to the Feishu ↔ Claude Code bridge. Versions follow
 semantic versioning. The running bridge stamps its version in the connection
 log: `connected (bot: …) [vX.Y.Z]`.
 
+## 0.16.2 — 2026-06-26
+
+- **Every slash command opened the `/effort` card.** Regression from 0.16.0: the
+  bare-`/effort` interception ran for *any* slash command. A command like `/model`
+  or `/context` failed the `/effort` regex, so the parsed argument fell back to an
+  empty string, which isn't a valid level, so the effort button card was sent and
+  the command returned early — never reaching the generic forwarder. The block now
+  only runs when the command actually starts with `/effort`; everything else passes
+  straight through to the TUI as before.
+
 ## 0.16.1 — 2026-06-25
 
 - **Lingering `bun server.ts` processes after a restart.** The lark server only

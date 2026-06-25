@@ -1991,7 +1991,10 @@ async function runControlCommand(chatId: string, ctrl: { keystrokes: string; lab
     // the generic forwarder below (same path as /model). Claude Code 2.1.x added the
     // real /effort command; the launch --effort flag is still the default a fresh
     // session falls back to.
-    {
+    // GUARD: only a real /effort command enters this block. Without it, a bare
+    // /model or /context fails the /effort regex → arg becomes '' → '' isn't a
+    // valid level → the effort card got sent for EVERY slash command (6/26 bug).
+    if (/^\/effort\b/i.test(ctrl.keystrokes.trim())) {
       const arg = (ctrl.keystrokes.trim().match(/^\/effort\b\s*(\S*)/i)?.[1] ?? '').toLowerCase()
       if (!/^(low|medium|high|xhigh|max)$/.test(arg)) {
         if (!(await sendEffortCard(chatId))) {
@@ -3249,7 +3252,7 @@ function startWsClient(): void {
   // Tie sleep/wake drift detection to socket ownership (idempotent via its own guard),
   // so the /lark:takeover and lock-reacquire owners get it too — not just cold start.
   startWakeWatcher()
-  connLog(`connected` + (botName ? ` (bot: ${botName})` : '') + ' [v0.16.1]')
+  connLog(`connected` + (botName ? ` (bot: ${botName})` : '') + ' [v0.16.2]')
 }
 
 function stopWsClient(): void {
