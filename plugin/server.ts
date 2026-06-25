@@ -3188,6 +3188,20 @@ function acquireLock(): boolean {
 process.stdin.on('end', () => process.exit(0))
 process.stdin.on('close', () => process.exit(0))
 
+// The stdin-EOF handlers above are a fast path, but they are unreliable: between
+// us and Claude sits a `bun run start` wrapper, and when Claude is SIGKILL'd (e.g.
+// the supervisor's single-instance guard before a relaunch) the orphaned-but-alive
+// wrapper can keep our stdin open, so 'end'/'close' never fires and we linger as an
+// orphan squatting toward the Feishu WS (the recurring stale-bun pileup, 2026-06-25).
+// Reliable backstop: capture the real Claude pid (our grandparent) once, and exit
+// when it dies — polled in the lock-check interval below. Captured ONCE because after
+// Claude exits the wrapper reparents to launchd (pid 1), so re-deriving each tick
+// would read a live pid and never fire. 0 / pid 1 => disabled, fall back to stdin.
+let parentClaudePid = 0
+try {
+  parentClaudePid = Number(execSync(`ps -o ppid= -p ${process.ppid}`, { encoding: 'utf8' }).trim()) || 0
+} catch {}
+
 await mcp.connect(new StdioServerTransport())
 await fetchBotInfo()
 registerSession()
@@ -3235,7 +3249,7 @@ function startWsClient(): void {
   // Tie sleep/wake drift detection to socket ownership (idempotent via its own guard),
   // so the /lark:takeover and lock-reacquire owners get it too — not just cold start.
   startWakeWatcher()
-  connLog(`connected` + (botName ? ` (bot: ${botName})` : '') + ' [v0.13.0]')
+  connLog(`connected` + (botName ? ` (bot: ${botName})` : '') + ' [v0.16.1]')
 }
 
 function stopWsClient(): void {
@@ -3295,6 +3309,10 @@ if (!IS_BRIDGE) {
 
 // Poll lock ownership and takeover signals
 lockCheckInterval = setInterval(() => {
+  // Orphan guard: if the Claude that launched us is gone, die with it. This is the
+  // reliable backstop for the brittle stdin-EOF path (see parentClaudePid above).
+  if (parentClaudePid > 1 && !isProcessAlive(parentClaudePid)) { shutdown(); return }
+
   // Check for takeover signal from /lark:takeover skill.
   // The signal file contains the Claude Code PID that requested takeover.
   // Each server.ts checks if the signal matches its own parent process.

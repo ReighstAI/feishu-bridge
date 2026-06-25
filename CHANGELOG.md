@@ -4,6 +4,17 @@ All notable changes to the Feishu ↔ Claude Code bridge. Versions follow
 semantic versioning. The running bridge stamps its version in the connection
 log: `connected (bot: …) [vX.Y.Z]`.
 
+## 0.16.1 — 2026-06-25
+
+- **Lingering `bun server.ts` processes after a restart.** The lark server only
+  self-exited on stdin EOF, which travels unreliably through the `bun run` wrapper
+  between it and Claude: a hard-killed Claude (e.g. the supervisor's single-instance
+  guard before a relaunch) could leave that wrapper holding stdin open, so the
+  server never saw EOF and lingered as an orphan. Over many restarts these stacked
+  up and contended for the single Feishu WebSocket. The server now also captures
+  Claude's pid at startup and exits when it dies, so it terminates reliably with its
+  parent. (The connection log now also stamps the real version again.)
+
 ## 0.16.0 — 2026-06-25
 
 - **`/effort` is now tappable buttons.** A bare `/effort` opened an interactive
