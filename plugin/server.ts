@@ -1984,11 +1984,22 @@ async function runControlCommand(chatId: string, ctrl: { keystrokes: string; lab
       return
     }
 
-    // /effort was once blocked here on the belief it was launch-only. As of Claude
-    // Code 2.1.x the TUI has a real `/effort <low|medium|high|xhigh|max>` command that
-    // switches effort mid-session ("this session only"), so we let it fall through to
-    // the generic forwarder below — same path as /model. The launch --effort flag is
-    // still the persistent default that a fresh session / restart falls back to.
+    // /effort. A bare `/effort` opens an interactive slider the phone user can't
+    // drive (the bridge can only snapshot it as flat text — an un-tappable card). So
+    // intercept bare /effort (or an unknown arg) and send tappable buttons instead.
+    // `/effort <low|medium|high|xhigh|max>` is a direct set — let it fall through to
+    // the generic forwarder below (same path as /model). Claude Code 2.1.x added the
+    // real /effort command; the launch --effort flag is still the default a fresh
+    // session falls back to.
+    {
+      const arg = (ctrl.keystrokes.trim().match(/^\/effort\b\s*(\S*)/i)?.[1] ?? '').toLowerCase()
+      if (!/^(low|medium|high|xhigh|max)$/.test(arg)) {
+        if (!(await sendEffortCard(chatId))) {
+          await notifyChat(chatId, '用法：/effort low | medium | high | xhigh | max —— 直接发带级别的命令也能切。')
+        }
+        return
+      }
+    }
 
     if (!tmuxReachable()) {
       throw new Error(`tmux session "${TMUX_SESSION}" 不可达 — 请用 bridge-supervisor.sh 启动`)
@@ -2258,6 +2269,50 @@ async function sendModeCard(chatId: string): Promise<boolean> {
     return true
   } catch (err) {
     process.stderr.write(`lark channel: mode card send failed: ${err}\n`)
+    return false
+  }
+}
+
+// ─── /effort: pick a reasoning-effort level via buttons ──────────────────────
+// Bare /effort opens an un-tappable slider in the TUI; we send these buttons
+// instead. A tap forwards `/effort <level>` (a direct set in Claude Code 2.1.x).
+const EFFORT_LABELS: Record<string, string> = {
+  low: '🐇 low', medium: '🚶 medium', high: '🧠 high', xhigh: '🔬 xhigh', max: '🛰 max',
+}
+function effortCard(): unknown {
+  const btn = (level: string, type: string) => ({
+    tag: 'button',
+    text: { tag: 'plain_text', content: EFFORT_LABELS[level] ?? level },
+    type,
+    value: { t: 'effort', level },
+  })
+  const menu =
+    '**🐇 low / 🚶 medium** — 更快、更省\n' +
+    '**🧠 high** — 均衡（Claude Code 默认）\n' +
+    '**🔬 xhigh** — 比 high 更深的推理，仅次于 max\n' +
+    '**🛰 max** — 最强，最慢最贵'
+  return {
+    config: { wide_screen_mode: true, update_multi: true },
+    header: { template: 'blue', title: { tag: 'plain_text', content: '🎚 选 effort 级别' } },
+    elements: [
+      { tag: 'div', text: { tag: 'lark_md', content: '点一个按钮，当前会话立刻切到该级别（也会存为新会话默认）👇' } },
+      { tag: 'div', text: { tag: 'lark_md', content: menu } },
+      { tag: 'hr' },
+      { tag: 'action', actions: [btn('high', 'primary'), btn('xhigh', 'danger')] },
+      { tag: 'action', actions: [btn('low', 'default'), btn('medium', 'default'), btn('max', 'default')] },
+    ],
+  }
+}
+async function sendEffortCard(chatId: string): Promise<boolean> {
+  try {
+    await larkApi('POST', '/im/v1/messages?receive_id_type=chat_id', {
+      receive_id: chatId,
+      msg_type: 'interactive',
+      content: JSON.stringify(effortCard()),
+    })
+    return true
+  } catch (err) {
+    process.stderr.write(`lark channel: effort card send failed: ${err}\n`)
     return false
   }
 }
@@ -2682,6 +2737,39 @@ async function handleCardAction(event: any): Promise<undefined> {
         } catch {}
       }
       void relaunchInMode(chatId, mode) // fire-and-forget so we ack the click first
+    }
+
+    if (value.t === 'effort') {
+      if (!tmuxReachable()) return undefined
+      const level = String((value as any).level || '').toLowerCase()
+      if (!/^(low|medium|high|xhigh|max)$/.test(level)) return undefined
+      const editCard = async (text: string) => {
+        if (!messageId) return
+        try {
+          await larkApi('PATCH', `/im/v1/messages/${messageId}`, {
+            content: JSON.stringify(noticeCard(text)),
+          })
+        } catch {}
+      }
+      // Fire-and-forget so the WS callback acks fast. `/effort <level>` is a direct
+      // set (no slider), so just type it and confirm via the TUI header.
+      void (async () => {
+        const label = EFFORT_LABELS[level] ?? level
+        await editCard(`🎚 正在切到 **${label}**…`)
+        if (!(await typeIntoTui(`/effort ${level}`))) {
+          await editCard('⚠️ 当前有回合在跑，切不动 effort——等它结束再点一次。')
+          return
+        }
+        await delay(150)
+        spawnSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Enter'])
+        await delay(1500)
+        const ok = paneFlat().includes(`with ${level} effort`)
+        connLog(`effort button: level=${level} ok=${ok}`)
+        await editCard(ok
+          ? `✅ 已切到 **${label}**（也存为新会话默认）。`
+          : `⚙️ 已发送 /effort ${level}；若没生效，在终端确认一下。`)
+      })()
+      return undefined
     }
 
     if (value.t === 'stop') {

@@ -4,6 +4,15 @@ All notable changes to the Feishu ↔ Claude Code bridge. Versions follow
 semantic versioning. The running bridge stamps its version in the connection
 log: `connected (bot: …) [vX.Y.Z]`.
 
+## 0.16.0 — 2026-06-25
+
+- **`/effort` is now tappable buttons.** A bare `/effort` opened an interactive
+  slider in the TUI that a phone user can't drive (the bridge could only snapshot
+  it as flat, un-tappable text). Bare `/effort` now sends a button card
+  (low / medium / high / xhigh / max); a tap forwards `/effort <level>`, which
+  sets it directly. Typing `/effort <level>` with the level still passes straight
+  through — and a level set this way is also saved as the default for new sessions.
+
 ## 0.15.0 — 2026-06-25
 
 - **`/effort` switches reasoning effort mid-session.** Claude Code 2.1.x added a
