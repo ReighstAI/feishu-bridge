@@ -2069,7 +2069,14 @@ async function runControlCommand(chatId: string, ctrl: { keystrokes: string; lab
     // inventory (everything from the "MCP tools" listing on) → a glanceable summary, not
     // a wall. Falls back to the full text if the marker isn't found (graceful).
     if (/^\/context\b/i.test(ctrl.keystrokes)) {
-      await waitPaneStable(4000)
+      // /context shows a loading spinner ("✦ Scampering…" + a static tip) for a beat
+      // while it tallies, then renders the usage chart. waitPaneStable latches onto
+      // that unchanging tip line and captures the loading frame instead of the report
+      // (6/26 bug). Wait for the chart itself first — its block glyphs (GRID) only
+      // appear once the real report is on screen — then let it settle before capture.
+      const ctxDeadline = Date.now() + 15000
+      while (Date.now() < ctxDeadline && !GRID.test(paneText())) await delay(500)
+      await waitPaneStable(3000)
       const out = captureCommandOutput(ctrl.keystrokes)
       if (out) {
         let t = out.text
@@ -3252,7 +3259,7 @@ function startWsClient(): void {
   // Tie sleep/wake drift detection to socket ownership (idempotent via its own guard),
   // so the /lark:takeover and lock-reacquire owners get it too — not just cold start.
   startWakeWatcher()
-  connLog(`connected` + (botName ? ` (bot: ${botName})` : '') + ' [v0.16.2]')
+  connLog(`connected` + (botName ? ` (bot: ${botName})` : '') + ' [v0.16.3]')
 }
 
 function stopWsClient(): void {

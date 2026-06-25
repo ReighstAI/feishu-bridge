@@ -4,6 +4,15 @@ All notable changes to the Feishu ↔ Claude Code bridge. Versions follow
 semantic versioning. The running bridge stamps its version in the connection
 log: `connected (bot: …) [vX.Y.Z]`.
 
+## 0.16.3 — 2026-06-26
+
+- **`/context` returned the loading frame, not the report.** `/context` shows a
+  spinner ("✦ Scampering…") with a static tip line for a beat while it tallies,
+  then renders the usage chart. The stability wait latched onto that unchanging
+  tip line and captured the loading screen instead of the actual breakdown. The
+  handler now waits for the usage chart to render (detected by its block glyphs)
+  before capturing, falling back to the old behavior if it never appears.
+
 ## 0.16.2 — 2026-06-26
 
 - **Every slash command opened the `/effort` card.** Regression from 0.16.0: the
